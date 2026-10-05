@@ -106,6 +106,9 @@ func (r *plexServerResolver) resolve(accountID, authToken, serverID string, load
 	if r.entries == nil {
 		r.entries = make(map[string]plexServerCacheEntry)
 	}
+	// A refreshed resource list may no longer grant access to this server.
+	// Never reuse its previous access token when the server is absent.
+	delete(r.entries, key)
 	for _, server := range servers {
 		serverKey := accountID + "\x00" + server.ClientIdentifier
 		r.entries[serverKey] = plexServerCacheEntry{

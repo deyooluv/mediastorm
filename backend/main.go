@@ -702,6 +702,7 @@ func main() {
 	}
 	libraryAccessService := libraryaccess.New(store.LibraryAccess(), store.LocalMedia(), store.RemoteMedia())
 	remotePlaybackReporter := remotemedia.NewPlaybackReporter(remoteMediaService)
+	remotePlaybackReporter.SetUserService(userService)
 	log.Printf("[startup] phase=media-and-scrobble-services duration=%s", time.Since(startupPhaseStarted))
 	startupPhaseStarted = time.Now()
 	multiRTScrobbler := history.NewMultiRealTimeScrobbler(

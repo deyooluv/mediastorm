@@ -15,6 +15,10 @@ import (
 
 const remotePlaybackReportInterval = 10 * time.Second
 
+type PlaybackUserService interface {
+	Get(id string) (models.User, bool)
+}
+
 type remotePlaybackSession struct {
 	lastReported time.Time
 	state        string
@@ -25,6 +29,7 @@ type remotePlaybackSession struct {
 // server when the active stream belongs to a Plex or Jellyfin library.
 type PlaybackReporter struct {
 	service  *Service
+	users    PlaybackUserService
 	mu       sync.Mutex
 	sessions map[string]remotePlaybackSession
 	now      func() time.Time
@@ -32,6 +37,12 @@ type PlaybackReporter struct {
 
 func NewPlaybackReporter(service *Service) *PlaybackReporter {
 	return &PlaybackReporter{service: service, sessions: make(map[string]remotePlaybackSession)}
+}
+
+// SetUserService supplies profile-to-Plex account associations. Profiles without
+// a connected Plex account must not write playback into the library owner's history.
+func (r *PlaybackReporter) SetUserService(users PlaybackUserService) {
+	r.users = users
 }
 
 func (r *PlaybackReporter) HandleProgressUpdate(userID string, update models.PlaybackProgressUpdate, _ float64) {
@@ -82,13 +93,14 @@ func (r *PlaybackReporter) report(userID string, update models.PlaybackProgressU
 	if err != nil || library == nil || library.Provider != provider {
 		return
 	}
-	if err := r.reportToProvider(context.Background(), library, item, sessionKey, state, previous.state, !previous.started, update); err != nil {
+	if err := r.reportToProvider(context.Background(), userID, library, item, sessionKey, state, previous.state, !previous.started, update); err != nil {
 		log.Printf("[remote-media] %s playback report failed for %s: %v", provider, item.Title, err)
 	}
 }
 
 func (r *PlaybackReporter) reportToProvider(
 	ctx context.Context,
+	userID string,
 	library *models.RemoteMediaLibrary,
 	item *models.RemoteMediaItem,
 	sessionKey, state, previousState string,
@@ -104,11 +116,22 @@ func (r *PlaybackReporter) reportToProvider(
 	duration := time.Duration(max(0, update.Duration) * float64(time.Second))
 
 	if library.Provider == models.MediaSourcePlex {
-		account := settings.Plex.GetAccountByID(library.AccountID)
-		if account == nil {
-			return ErrNotFound
+		if r.users == nil {
+			return nil
 		}
-		server, err := r.service.plexServerForLibrary(library, account.AuthToken)
+		user, ok := r.users.Get(userID)
+		if !ok || strings.TrimSpace(user.PlexAccountID) == "" {
+			return nil
+		}
+		account := settings.Plex.GetAccountByID(user.PlexAccountID)
+		if account == nil || strings.TrimSpace(account.AuthToken) == "" {
+			return nil
+		}
+		// Keep the source server/item and verified address, but resolve its access
+		// token under the viewing profile's account, including the cache key.
+		playbackLibrary := *library
+		playbackLibrary.AccountID = account.ID
+		server, err := r.service.plexServerForLibrary(&playbackLibrary, account.AuthToken)
 		if err != nil {
 			return err
 		}
