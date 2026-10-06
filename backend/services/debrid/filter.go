@@ -30,6 +30,7 @@ type FilterOptions struct {
 	IsAnime               bool   // True when metadata identifies the series as anime
 	IsDaily               bool   // True for daily shows (talk shows, news) - filter by date
 	TargetAirDate         string // For daily shows: air date in YYYY-MM-DD format
+	SeasonPacksOnly       bool   // Reject releases that cannot supply the whole target season
 }
 
 // FilterResults filters search results based on parsed title information
@@ -58,6 +59,7 @@ func FilterResults(results []models.NZBResult, opts FilterOptions) []models.NZBR
 		IsAnime:               opts.IsAnime,
 		IsDaily:               opts.IsDaily,
 		TargetAirDate:         opts.TargetAirDate,
+		SeasonPacksOnly:       opts.SeasonPacksOnly,
 	}
 	return filter.Results(results, filterOpts)
 }

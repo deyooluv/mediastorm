@@ -1287,6 +1287,7 @@ type SearchOptions struct {
 	IncludeScoreBreakdown bool                              // When true, attach per-criterion scoring details (admin search tester)
 	SkipFilter            bool                              // When true, skip filtering entirely (used by SearchTest)
 	UseDownloadRanking    bool                              // When true, apply download-only preferred terms as a final ranking boost
+	SeasonPacksOnly       bool                              // When true, keep only releases that cover the whole target season ("Download Season")
 
 	// Internal Newznab request controls used by the daily-show tiered search.
 	usenetSearchType      string
@@ -1368,6 +1369,7 @@ type searchCacheOptions struct {
 	IncludeFiltered       bool
 	SkipFilter            bool
 	UseDownloadRanking    bool
+	SeasonPacksOnly       bool
 }
 
 func buildSearchCacheOptions(opts SearchOptions) searchCacheOptions {
@@ -1395,6 +1397,7 @@ func buildSearchCacheOptions(opts SearchOptions) searchCacheOptions {
 		IncludeFiltered:       opts.IncludeFiltered,
 		SkipFilter:            opts.SkipFilter,
 		UseDownloadRanking:    opts.UseDownloadRanking,
+		SeasonPacksOnly:       opts.SeasonPacksOnly,
 	}
 }
 
@@ -1622,9 +1625,10 @@ func (s *Service) Search(ctx context.Context, opts SearchOptions) ([]models.NZBR
 		return cached, nil
 	}
 	sourceOpts := opts
-	if rankingBundle.NewestReleaseFirst {
+	if rankingBundle.NewestReleaseFirst || opts.SeasonPacksOnly {
 		// Source-level caps can discard newer releases before the final
-		// cross-source ordering override has a chance to see them.
+		// cross-source ordering override has a chance to see them, and in
+		// season-pack mode single episodes would crowd packs out of the cap.
 		sourceOpts.MaxResults = 0
 	}
 
@@ -1693,6 +1697,7 @@ func (s *Service) Search(ctx context.Context, opts SearchOptions) ([]models.NZBR
 				SeasonPremiereYear:    opts.SeasonPremiereYear,
 				EpisodeReleased:       opts.EpisodeReleased,
 				SkipFilter:            opts.SkipFilter,
+				SeasonPacksOnly:       opts.SeasonPacksOnly,
 			}
 			debridResults, err := s.searchDebridTitles(ctx, debOpts, opts, alternateTitles)
 			log.Printf("[indexer] TIMING: debrid search complete (took: %v, results: %d)", time.Since(debridStart), len(debridResults))
@@ -2845,6 +2850,7 @@ func (s *Service) buildFilterOptions(opts SearchOptions, filterSettings models.F
 		TargetEpisode:         parsedQuery.Episode,
 		TargetAbsoluteEpisode: opts.AbsoluteEpisodeNumber,
 		IsAnime:               opts.IsAnime,
+		SeasonPacksOnly:       opts.SeasonPacksOnly,
 	}
 }
 
@@ -3356,6 +3362,11 @@ func isReleaseFriendlyTitle(value string) bool {
 }
 
 func buildSearchQueries(opts SearchOptions, parsed debrid.ParsedQuery, alternateTitles []string) []string {
+	if opts.SeasonPacksOnly && parsed.HasSeasonMatch {
+		// ParseQuery defaults season-only queries to E01; searching "Title
+		// S01E01" for a season pack only surfaces single first episodes.
+		parsed.Episode = 0
+	}
 	seen := make(map[string]struct{})
 	var queries []string
 	addQuery := func(q string) {
@@ -4208,6 +4219,7 @@ func (s *Service) applyUsenetFilteringWithSettings(results []models.NZBResult, o
 		IsAnime:               opts.IsAnime,
 		IsDaily:               opts.IsDaily,
 		TargetAirDate:         opts.TargetAirDate,
+		SeasonPacksOnly:       opts.SeasonPacksOnly,
 	}
 
 	log.Printf("[indexer/usenet] Applying filter with title=%q, year=%d, isMovie=%t, isDaily=%t, airDate=%q",

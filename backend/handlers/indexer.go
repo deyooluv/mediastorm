@@ -173,6 +173,11 @@ func (h *IndexerHandler) Search(w http.ResponseWriter, r *http.Request) {
 	if useDownloadRanking {
 		opts.UseDownloadRanking = true
 	}
+	// "Download Season" resolves every episode from the one selected release,
+	// so single-episode results must not be offered.
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("seasonPacks")), "true") && mediaType == "series" {
+		opts.SeasonPacksOnly = true
+	}
 
 	// Check if caller wants filtered results included
 	includeFiltered := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("includeFiltered"))) == "true"

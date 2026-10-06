@@ -164,6 +164,28 @@ func TestIndexerHandler_SearchDownloadRanking(t *testing.T) {
 	}
 }
 
+func TestIndexerHandler_SearchSeasonPacks(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  bool
+	}{
+		{"q=The+Expanse+S01&mediaType=series&seasonPacks=true", true},
+		{"q=The+Expanse+S01&mediaType=series", false},
+		{"q=The+Expanse&mediaType=movie&seasonPacks=true", false},
+	} {
+		fake := &fakeIndexerService{results: []models.NZBResult{}}
+		handler := NewIndexerHandler(fake, false)
+		rec := httptest.NewRecorder()
+		handler.Search(rec, httptest.NewRequest(http.MethodGet, "/api/indexers/search?"+tc.query, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: expected %d, got %d", tc.query, http.StatusOK, rec.Code)
+		}
+		if fake.lastOpts.SeasonPacksOnly != tc.want {
+			t.Fatalf("%s: SeasonPacksOnly = %v, want %v", tc.query, fake.lastOpts.SeasonPacksOnly, tc.want)
+		}
+	}
+}
+
 func TestIndexerHandler_SearchDefaultLimit(t *testing.T) {
 	fake := &fakeIndexerService{results: []models.NZBResult{}}
 	handler := NewIndexerHandler(fake, false)

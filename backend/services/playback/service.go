@@ -99,6 +99,9 @@ type externalUsenetJob struct {
 	LastStatus     string
 	LastError      string
 	ReuseKey       string
+	// Hints carry the submitting request's episode target so a completed
+	// season pack resolves to that episode rather than its largest file.
+	Hints mediaresolve.SelectionHints
 }
 
 type externalResolvedResult struct {
@@ -109,6 +112,9 @@ type externalResolvedResult struct {
 var (
 	ErrQueueItemNotFound = errors.New("playback queue item not found")
 	ErrQueueItemFailed   = errors.New("playback queue item failed")
+	// ErrEpisodeNotInRelease reports that a release resolved but contains no
+	// file for the requested episode (e.g. a pack missing that episode).
+	ErrEpisodeNotInRelease = errors.New("directory contains no matching episode file")
 )
 
 const (
@@ -209,11 +215,12 @@ func (s *Service) SetDebridFullProber(prober debrid.PreResolvedFullProber) {
 	s.debrid.SetFullProber(prober)
 }
 
-// ResolveBatch performs a single set of provider API calls and resolves all episodes from memory.
-// Only supported for debrid results.
+// ResolveBatch resolves all requested episodes from one release. Debrid
+// performs a single set of provider API calls; usenet imports the release once
+// and selects each episode's file from it.
 func (s *Service) ResolveBatch(ctx context.Context, candidate models.NZBResult, episodes []models.BatchEpisodeTarget) (*models.BatchResolveResponse, error) {
 	if candidate.ServiceType != models.ServiceTypeDebrid {
-		return nil, fmt.Errorf("batch resolve is only supported for debrid results")
+		return s.resolveUsenetBatch(ctx, candidate, episodes)
 	}
 	if s.debrid == nil {
 		return nil, fmt.Errorf("debrid service not configured")
@@ -706,10 +713,30 @@ func (s *Service) resolveExternalUsenet(ctx context.Context, settings config.Set
 	sourceNZBPath := strings.TrimSpace(submitFileName)
 	fileSize := estimateNZBFileSize(submitNZB)
 	reuseKey := externalUsenetReuseKey(engineSettings, submitNZB)
+	hints := buildSelectionHintsFromCandidate(candidate, "")
 
 	for {
 		if res, ok := s.reuseExternalUsenetResolution(ctx, reuseKey, engineSettings, sourceNZBPath, fileSize); ok {
-			return res, nil
+			if !externalResolutionConflictsWithTargetEpisode(res.WebDAVPath, candidate) {
+				return res, nil
+			}
+			// The cached file was selected for another episode of the same
+			// release (a season pack). Re-select inside the completed release
+			// instead of resubmitting the NZB.
+			log.Printf("[playback] external usenet cached resolution is for another episode; reselecting target=%q cached=%q", hints.TargetEpisodeCode, safeURLForLog(res.WebDAVPath))
+			existingURL, found, err := s.findExistingExternalUsenetResolution(ctx, engineSettings, candidate, sourceNZBPath, hints)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, fmt.Errorf("%w: %s not found in completed release %q", ErrEpisodeNotInRelease, hints.TargetEpisodeCode, sourceNZBPath)
+			}
+			return &models.PlaybackResolution{
+				WebDAVPath:    existingURL,
+				HealthStatus:  "healthy",
+				FileSize:      fileSize,
+				SourceNZBPath: sourceNZBPath,
+			}, nil
 		}
 		claimed, wait := s.claimExternalSubmission(reuseKey)
 		if claimed {
@@ -723,7 +750,11 @@ func (s *Service) resolveExternalUsenet(ctx context.Context, settings config.Set
 	}
 	defer s.releaseExternalSubmission(reuseKey)
 
-	if existingURL, ok := s.findExistingExternalUsenetResolution(ctx, engineSettings, candidate, sourceNZBPath); ok {
+	existingURL, ok, err := s.findExistingExternalUsenetResolution(ctx, engineSettings, candidate, sourceNZBPath, hints)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		log.Printf("[playback] external usenet existing resolution found before submit engine=%q type=%q fileName=%q streamURL=%q; skipping NZB submit", engineSettings.Name, engineSettings.Type, submitFileName, safeURLForLog(existingURL))
 		return &models.PlaybackResolution{
 			WebDAVPath:    existingURL,
@@ -762,6 +793,7 @@ func (s *Service) resolveExternalUsenet(ctx context.Context, settings config.Set
 		CreatedAt:      time.Now(),
 		LastStatus:     string(usenetengine.StatusQueued),
 		ReuseKey:       reuseKey,
+		Hints:          hints,
 	}
 	s.externalByKey[reuseKey] = queueID
 	s.externalMu.Unlock()
@@ -882,8 +914,13 @@ func (s *Service) ResolveExternalUsenetForProbe(ctx context.Context, candidate m
 		submitNZB, submitFileName = prepareAltMountNZBSubmission(candidate, nzbBytes, fileName)
 	}
 	sourceNZBPath := strings.TrimSpace(submitFileName)
+	hints := buildSelectionHintsFromCandidate(candidate, "")
 
-	if existingURL, ok := s.findExistingExternalUsenetResolution(ctx, engineSettings, candidate, sourceNZBPath); ok {
+	existingURL, ok, err := s.findExistingExternalUsenetResolution(ctx, engineSettings, candidate, sourceNZBPath, hints)
+	if err != nil {
+		return "", "", true, err
+	}
+	if ok {
 		log.Printf("[playback] external usenet probe existing resolution found engine=%q type=%q fileName=%q streamURL=%q", engineSettings.Name, engineSettings.Type, submitFileName, safeURLForLog(existingURL))
 		return existingURL, externalWebDAVAuthHeader(engineSettings), true, nil
 	}
@@ -938,7 +975,7 @@ func (s *Service) ResolveExternalUsenetForProbe(ctx context.Context, candidate m
 			return "", "", true, fmt.Errorf("%w: %s", ErrQueueItemFailed, errMsg)
 		case usenetengine.StatusCompleted:
 			if statusFileNameMatchesSubmission && externalOutputPathMatchesSubmitted(engineSettings.Type, status.OutputPath, strings.TrimSpace(candidate.Title), sourceNZBPath) {
-				resolvedURL, resolveErr := s.resolveExternalWebDAVStream(pollCtx, engineSettings, status.OutputPath)
+				resolvedURL, resolveErr := s.resolveExternalWebDAVStream(pollCtx, engineSettings, status.OutputPath, hints)
 				if resolveErr != nil {
 					return "", "", true, resolveErr
 				}
@@ -946,7 +983,7 @@ func (s *Service) ResolveExternalUsenetForProbe(ctx context.Context, candidate m
 					return resolvedURL, externalWebDAVAuthHeader(engineSettings), true, nil
 				}
 			}
-			fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(pollCtx, engineSettings, strings.TrimSpace(candidate.Title), sourceNZBPath)
+			fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(pollCtx, engineSettings, strings.TrimSpace(candidate.Title), sourceNZBPath, hints)
 			if fallbackErr != nil {
 				return "", "", true, fallbackErr
 			}
@@ -954,11 +991,12 @@ func (s *Service) ResolveExternalUsenetForProbe(ctx context.Context, candidate m
 				return fallbackURL, externalWebDAVAuthHeader(engineSettings), true, nil
 			}
 		default:
-			fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(pollCtx, engineSettings, strings.TrimSpace(candidate.Title), sourceNZBPath)
-			if fallbackErr != nil {
+			fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(pollCtx, engineSettings, strings.TrimSpace(candidate.Title), sourceNZBPath, hints)
+			// A still-running job may not have written the target episode yet.
+			if fallbackErr != nil && !errors.Is(fallbackErr, ErrEpisodeNotInRelease) {
 				return "", "", true, fallbackErr
 			}
-			if ok {
+			if ok && fallbackErr == nil {
 				return fallbackURL, externalWebDAVAuthHeader(engineSettings), true, nil
 			}
 		}
@@ -1056,7 +1094,7 @@ func (s *Service) externalQueueStatus(ctx context.Context, queueID int64) (*mode
 		streamURL := ""
 		if statusFileNameMatchesSubmission && externalOutputPathMatchesSubmitted(job.Engine.Type, status.OutputPath, job.SubmittedTitle, sourceNZBPath) {
 			var urlErr error
-			streamURL, urlErr = s.resolveExternalWebDAVStream(ctx, job.Engine, status.OutputPath)
+			streamURL, urlErr = s.resolveExternalWebDAVStream(ctx, job.Engine, status.OutputPath, job.Hints)
 			if urlErr != nil {
 				return nil, true, urlErr
 			}
@@ -1064,7 +1102,7 @@ func (s *Service) externalQueueStatus(ctx context.Context, queueID int64) (*mode
 		if streamURL == "" {
 			log.Printf("[playback] external usenet completed output not bound to submitted release queueID=%d engineJobID=%q submitted=%q sourceNZB=%q statusFileName=%q output=%q; probing exact WebDAV fallback",
 				queueID, job.EngineJobID, job.SubmittedTitle, sourceNZBPath, statusFileName, status.OutputPath)
-			if fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(ctx, job.Engine, job.SubmittedTitle, sourceNZBPath); fallbackErr != nil {
+			if fallbackURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(ctx, job.Engine, job.SubmittedTitle, sourceNZBPath, job.Hints); fallbackErr != nil {
 				return nil, true, fallbackErr
 			} else if ok {
 				log.Printf("[playback] external usenet completed via fallback queueID=%d engineJobID=%q sourceNZB=%q streamURL=%q; deleting in-memory job without writing resolved NZB cache", queueID, job.EngineJobID, sourceNZBPath, safeURLForLog(fallbackURL))
@@ -1098,9 +1136,11 @@ func (s *Service) externalQueueStatus(ctx context.Context, queueID int64) (*mode
 		s.deleteExternalJob(queueID)
 		return resolution, true, nil
 	default:
-		if streamURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(ctx, job.Engine, job.SubmittedTitle, sourceNZBPath); fallbackErr != nil {
+		// A still-running job may not have written the target episode yet, so
+		// a pack without it is not terminal here.
+		if streamURL, ok, fallbackErr := s.resolveExternalWebDAVFallback(ctx, job.Engine, job.SubmittedTitle, sourceNZBPath, job.Hints); fallbackErr != nil && !errors.Is(fallbackErr, ErrEpisodeNotInRelease) {
 			return nil, true, fallbackErr
-		} else if ok {
+		} else if ok && fallbackErr == nil {
 			log.Printf("[playback] external usenet fallback found before terminal status queueID=%d engineJobID=%q sourceNZB=%q streamURL=%q; deleting in-memory job without writing resolved NZB cache", queueID, job.EngineJobID, sourceNZBPath, safeURLForLog(streamURL))
 			resolution := &models.PlaybackResolution{
 				QueueID:       queueID,
@@ -1294,7 +1334,7 @@ func externalHealthStatus(status usenetengine.Status) string {
 	}
 }
 
-func (s *Service) resolveExternalWebDAVStream(ctx context.Context, engine config.UsenetEngineSettings, outputPath string) (string, error) {
+func (s *Service) resolveExternalWebDAVStream(ctx context.Context, engine config.UsenetEngineSettings, outputPath string, hints mediaresolve.SelectionHints) (string, error) {
 	streamURL, err := externalWebDAVURL(engine, outputPath)
 	if err != nil {
 		return "", err
@@ -1306,7 +1346,7 @@ func (s *Service) resolveExternalWebDAVStream(ctx context.Context, engine config
 		return "", fmt.Errorf("external usenet engine selected non-content media path: %s", path.Base(streamURL))
 	}
 
-	selected, err := s.findExternalWebDAVMediaFile(ctx, engine, streamURL, 0)
+	selected, err := s.findExternalWebDAVMediaFileForHints(ctx, engine, streamURL, hints)
 	if err != nil {
 		return "", err
 	}
@@ -1316,24 +1356,30 @@ func (s *Service) resolveExternalWebDAVStream(ctx context.Context, engine config
 	return selected, nil
 }
 
-func (s *Service) findExistingExternalUsenetResolution(ctx context.Context, engine config.UsenetEngineSettings, candidate models.NZBResult, sourceNZBPath string) (string, bool) {
+// findExistingExternalUsenetResolution looks for the release already present on
+// the engine's WebDAV. It returns an error only when the release exists but has
+// no file for the requested episode, so callers fail instead of resubmitting.
+func (s *Service) findExistingExternalUsenetResolution(ctx context.Context, engine config.UsenetEngineSettings, candidate models.NZBResult, sourceNZBPath string, hints mediaresolve.SelectionHints) (string, bool, error) {
 	if strings.TrimSpace(engine.WebDAVBaseURL) == "" {
 		log.Printf("[playback] external usenet existing resolution check skipped engine=%q type=%q fileName=%q reason=%q", engine.Name, engine.Type, sourceNZBPath, "webdavBaseUrl not configured")
-		return "", false
+		return "", false, nil
 	}
-	streamURL, ok, err := s.resolveExternalWebDAVFallback(ctx, engine, strings.TrimSpace(candidate.Title), sourceNZBPath)
+	streamURL, ok, err := s.resolveExternalWebDAVFallback(ctx, engine, strings.TrimSpace(candidate.Title), sourceNZBPath, hints)
 	if err != nil {
+		if errors.Is(err, ErrEpisodeNotInRelease) {
+			return "", false, err
+		}
 		log.Printf("[playback] external usenet existing resolution check failed engine=%q type=%q fileName=%q: %v", engine.Name, engine.Type, sourceNZBPath, err)
-		return "", false
+		return "", false, nil
 	}
 	if !ok || strings.TrimSpace(streamURL) == "" {
 		log.Printf("[playback] external usenet existing resolution check miss engine=%q type=%q fileName=%q title=%q", engine.Name, engine.Type, sourceNZBPath, strings.TrimSpace(candidate.Title))
-		return "", false
+		return "", false, nil
 	}
-	return streamURL, true
+	return streamURL, true, nil
 }
 
-func (s *Service) resolveExternalWebDAVFallback(ctx context.Context, engine config.UsenetEngineSettings, submittedTitle, sourceNZBPath string) (string, bool, error) {
+func (s *Service) resolveExternalWebDAVFallback(ctx context.Context, engine config.UsenetEngineSettings, submittedTitle, sourceNZBPath string, hints mediaresolve.SelectionHints) (string, bool, error) {
 	engineType := strings.ToLower(strings.TrimSpace(engine.Type))
 	releaseNames := externalFallbackReleaseNames(submittedTitle, sourceNZBPath)
 	if len(releaseNames) == 0 {
@@ -1356,8 +1402,11 @@ func (s *Service) resolveExternalWebDAVFallback(ctx context.Context, engine conf
 						return candidateURL, true, nil
 					}
 				}
-				selected, err := s.findExternalWebDAVMediaFile(ctx, engine, candidateURL, 0)
+				selected, err := s.findExternalWebDAVMediaFileForHints(ctx, engine, candidateURL, hints)
 				if err != nil {
+					if errors.Is(err, ErrEpisodeNotInRelease) {
+						return "", true, err
+					}
 					continue
 				}
 				if selected == "" {
@@ -1623,6 +1672,127 @@ func (s *Service) findExternalWebDAVMediaFile(ctx context.Context, engine config
 	}
 
 	return bestURL, nil
+}
+
+// externalMediaEntry is a playable file found while walking an external
+// engine's WebDAV release directory. Rclone links are resolved lazily so only
+// the selected file costs a round-trip.
+type externalMediaEntry struct {
+	url        string
+	label      string
+	priority   int
+	rcloneLink bool
+}
+
+// findExternalWebDAVMediaFileForHints selects the media file for the hinted
+// episode inside a release directory. Without an explicit episode target it
+// keeps the largest/highest-priority selection of findExternalWebDAVMediaFile.
+// A directory with playable files but none for the target episode returns
+// ErrEpisodeNotInRelease.
+func (s *Service) findExternalWebDAVMediaFileForHints(ctx context.Context, engine config.UsenetEngineSettings, directoryURL string, hints mediaresolve.SelectionHints) (string, error) {
+	if !hasExplicitEpisodeTarget(hints) {
+		return s.findExternalWebDAVMediaFile(ctx, engine, directoryURL, 0)
+	}
+	entries, err := s.collectExternalWebDAVMediaEntries(ctx, engine, directoryURL, 0)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		return "", nil
+	}
+	candidates := make([]mediaresolve.Candidate, len(entries))
+	for i, entry := range entries {
+		candidates[i] = mediaresolve.Candidate{Label: entry.label, Priority: entry.priority}
+	}
+	if strings.TrimSpace(hints.Directory) == "" {
+		hints.Directory = externalURLPathLabel(directoryURL)
+	}
+	idx, reason := mediaresolve.SelectBestCandidate(candidates, hints)
+	if idx < 0 {
+		if strings.TrimSpace(reason) == "" {
+			reason = "no file matches the requested episode"
+		}
+		return "", fmt.Errorf("%w: %s", ErrEpisodeNotInRelease, reason)
+	}
+	selected := entries[idx]
+	log.Printf("[playback] external usenet selected episode file %q (%s)", selected.label, reason)
+	if selected.rcloneLink {
+		return s.resolveExternalRcloneLink(ctx, engine, selected.url)
+	}
+	return selected.url, nil
+}
+
+func (s *Service) collectExternalWebDAVMediaEntries(ctx context.Context, engine config.UsenetEngineSettings, directoryURL string, depth int) ([]externalMediaEntry, error) {
+	if depth > webDAVScanMaxDepth {
+		return nil, nil
+	}
+	entries, err := s.listExternalWebDAVDirectory(ctx, engine, directoryURL)
+	if err != nil {
+		return nil, err
+	}
+	var out []externalMediaEntry
+	for _, entry := range entries {
+		if entry.URL == "" {
+			continue
+		}
+		if entry.IsDir {
+			name := strings.ToLower(strings.Trim(strings.TrimSpace(entry.Name), "/"))
+			if name == "sample" || name == "samples" || name == "extras" || name == "extra" {
+				continue
+			}
+			nested, nestedErr := s.collectExternalWebDAVMediaEntries(ctx, engine, entry.URL, depth+1)
+			if nestedErr != nil {
+				return nil, nestedErr
+			}
+			out = append(out, nested...)
+			continue
+		}
+		if isExternalRcloneLinkURL(entry.URL) {
+			if !isExternalPlayableRcloneLink(entry.URL, entry.Name) || isNonContentMediaPath(entry.URL) {
+				continue
+			}
+			label := externalURLPathLabel(entry.URL)
+			out = append(out, externalMediaEntry{
+				url:        entry.URL,
+				label:      strings.TrimSuffix(label, path.Ext(label)),
+				priority:   externalMediaPriorityForPath(firstNonEmpty(entry.Name, entry.URL)),
+				rcloneLink: true,
+			})
+			continue
+		}
+		if !isExternalPlayableURL(entry.URL) || isNonContentMediaPath(entry.URL) {
+			continue
+		}
+		out = append(out, externalMediaEntry{
+			url:      entry.URL,
+			label:    externalURLPathLabel(entry.URL),
+			priority: externalMediaPriority(entry.URL),
+		})
+	}
+	return out, nil
+}
+
+// externalURLPathLabel returns the decoded path of a WebDAV URL for episode
+// matching (release directory and file names carry the SxxEyy codes).
+func externalURLPathLabel(rawURL string) string {
+	pathText := strings.TrimSpace(rawURL)
+	if parsed, err := url.Parse(pathText); err == nil && parsed.Path != "" {
+		pathText = parsed.Path
+	}
+	if decoded, err := url.PathUnescape(pathText); err == nil {
+		pathText = decoded
+	}
+	return pathText
+}
+
+// externalResolutionConflictsWithTargetEpisode reports whether a completed
+// external resolution points at a file for a different episode than the one
+// the candidate targets (a reused season-pack resolution).
+func externalResolutionConflictsWithTargetEpisode(webDAVPath string, candidate models.NZBResult) bool {
+	if strings.TrimSpace(webDAVPath) == "" {
+		return false
+	}
+	return resolvedFileConflictsWithTargetEpisode(externalURLPathLabel(webDAVPath), candidate)
 }
 
 func (s *Service) resolveExternalRcloneLink(ctx context.Context, engine config.UsenetEngineSettings, linkURL string) (string, error) {
@@ -2327,6 +2497,15 @@ func buildSelectionHintsFromCandidate(candidate models.NZBResult, directory stri
 	return hints
 }
 
+// hasExplicitEpisodeTarget reports whether hints name a specific episode, in
+// which case file selection must match it rather than fall back to any file.
+func hasExplicitEpisodeTarget(hints mediaresolve.SelectionHints) bool {
+	return (hints.TargetSeason > 0 && hints.TargetEpisode > 0) ||
+		strings.TrimSpace(hints.TargetEpisodeCode) != "" ||
+		hints.AbsoluteEpisodeNumber > 0 ||
+		(hints.IsDaily && strings.TrimSpace(hints.TargetAirDate) != "")
+}
+
 // findBestMediaFile recursively scans a directory for the best playable media file
 func (s *Service) findBestMediaFile(dirPath string, hints mediaresolve.SelectionHints) (string, error) {
 	var candidates []mediaFileCandidate
@@ -2413,10 +2592,7 @@ func (s *Service) findBestMediaFile(dirPath string, hints mediaresolve.Selection
 		return "", fmt.Errorf("no playable media files found")
 	}
 
-	hasExplicitEpisodeTarget := (hints.TargetSeason > 0 && hints.TargetEpisode > 0) ||
-		strings.TrimSpace(hints.TargetEpisodeCode) != "" ||
-		hints.AbsoluteEpisodeNumber > 0 ||
-		(hints.IsDaily && strings.TrimSpace(hints.TargetAirDate) != "")
+	hasExplicitEpisodeTarget := hasExplicitEpisodeTarget(hints)
 
 	if len(candidates) == 1 && !hasExplicitEpisodeTarget {
 		log.Printf("[playback] only playable file found; selecting %q", candidates[0].path)
@@ -2440,7 +2616,7 @@ func (s *Service) findBestMediaFile(dirPath string, hints mediaresolve.Selection
 		if strings.TrimSpace(reason) == "" {
 			reason = "no file matches the requested episode"
 		}
-		return "", fmt.Errorf("directory contains no matching episode file: %s", reason)
+		return "", fmt.Errorf("%w: %s", ErrEpisodeNotInRelease, reason)
 	}
 
 	if bestIdx != -1 {

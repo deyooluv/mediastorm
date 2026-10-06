@@ -161,6 +161,10 @@ type Options struct {
 	IsAnime               bool   // True when metadata identifies the series as anime
 	IsDaily               bool   // True for daily shows (talk shows, news) - filter by date
 	TargetAirDate         string // For daily shows: air date in YYYY-MM-DD format
+	// SeasonPacksOnly rejects single-episode (and partial multi-episode)
+	// releases for a season-only target. Used by "Download Season", where every
+	// episode of the season is resolved from the one selected release.
+	SeasonPacksOnly bool
 }
 
 // NormalizeCountryCode canonicalizes ISO 3166 alpha-2/alpha-3 values and the
@@ -286,6 +290,11 @@ func Results(results []models.NZBResult, opts Options) []models.NZBResult {
 func ResultsWithDetails(results []models.NZBResult, opts Options) []FilteredResult {
 	if len(results) == 0 {
 		return nil
+	}
+	if opts.SeasonPacksOnly && !opts.IsMovie {
+		// Season-only queries are parsed with a default E01 (Stremio stream IDs
+		// need an episode); a season-pack search targets the whole season.
+		opts.TargetEpisode = 0
 	}
 
 	// Don't filter if we don't have an expected title
@@ -565,6 +574,14 @@ func ResultsWithDetails(results []models.NZBResult, opts Options) []FilteredResu
 					if mapped.AbsoluteEpisode > 0 {
 						result.Attributes["absoluteEpisodeNumber"] = strconv.Itoa(mapped.AbsoluteEpisode)
 					}
+				}
+			}
+
+			if opts.SeasonPacksOnly && !opts.IsMovie {
+				if rejected, reason := shouldRejectNonSeasonPack(parsed, isCompletePack, hasDailyDate, episodeOpts); rejected {
+					log.Printf("[filter] Rejecting %q: %s", result.Title, reason)
+					reject(result, reason)
+					continue
 				}
 			}
 
@@ -1631,6 +1648,53 @@ func getPackEpisodeCount(seasons []int, isCompletePack bool, resolver EpisodeCou
 // Deprecated: use getPackEpisodeCount instead
 func estimatePackEpisodeCount(seasons []int, totalSeriesEpisodes int) int {
 	return getPackEpisodeCount(seasons, len(seasons) == 0, nil, totalSeriesEpisodes)
+}
+
+// minUnverifiedPackEpisodes is the smallest episode range accepted as a season
+// pack when metadata cannot confirm the season's episode count.
+const minUnverifiedPackEpisodes = 3
+
+// shouldRejectNonSeasonPack rejects releases that cannot supply a whole season:
+// single episodes, dated daily episodes, and episode ranges that do not cover
+// the target season. Episode-less season/complete packs pass; their season was
+// already validated by shouldRejectByTargetEpisode.
+func shouldRejectNonSeasonPack(parsed *parsett.ParsedTitle, isCompletePack, hasDailyDate bool, opts Options) (bool, string) {
+	if parsed == nil {
+		return false, ""
+	}
+	if hasDailyDate {
+		return true, "dated episode release is not a season pack"
+	}
+	if isCompletePack || len(parsed.Episodes) == 0 {
+		return false, ""
+	}
+	if len(parsed.Episodes) == 1 {
+		return true, fmt.Sprintf("single episode E%02d is not a season pack", parsed.Episodes[0])
+	}
+
+	minEp, maxEp := parsed.Episodes[0], parsed.Episodes[0]
+	for _, ep := range parsed.Episodes {
+		if ep < minEp {
+			minEp = ep
+		}
+		if ep > maxEp {
+			maxEp = ep
+		}
+	}
+	expected := 0
+	if opts.EpisodeResolver != nil && opts.TargetSeason > 0 {
+		expected = opts.EpisodeResolver.GetEpisodesForSeasons([]int{opts.TargetSeason})
+	}
+	if expected > 0 {
+		if minEp <= 1 && maxEp >= expected {
+			return false, ""
+		}
+		return true, fmt.Sprintf("episode range E%02d-E%02d does not cover the %d-episode season", minEp, maxEp, expected)
+	}
+	if minEp <= 1 && len(parsed.Episodes) >= minUnverifiedPackEpisodes {
+		return false, ""
+	}
+	return true, fmt.Sprintf("episode range E%02d-E%02d is not a season pack", minEp, maxEp)
 }
 
 // shouldRejectByTargetEpisode checks if a result should be rejected based on target episode info.

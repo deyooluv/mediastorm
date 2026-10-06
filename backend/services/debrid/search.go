@@ -66,6 +66,7 @@ type SearchOptions struct {
 	SeasonPremiereYear    int                         // Premiere year of the requested season only.
 	EpisodeReleased       bool                        // True only when metadata confirms the target episode has aired
 	SkipFilter            bool                        // When true, skip result filtering (used by SearchTest)
+	SeasonPacksOnly       bool                        // When true, keep only releases that cover the whole target season
 }
 
 // SearchService coordinates queries against configured debrid providers.
@@ -704,6 +705,7 @@ func (s *SearchService) Search(ctx context.Context, opts SearchOptions) ([]model
 			IsAnime:               opts.IsAnime,
 			IsDaily:               opts.IsDaily,
 			TargetAirDate:         opts.TargetAirDate,
+			SeasonPacksOnly:       opts.SeasonPacksOnly,
 		}
 		aggregate = FilterResults(aggregate, filterOpts)
 	}
