@@ -1137,6 +1137,9 @@
     const WEB_PREQUEUE_MAX_POLLS = 40;
     const SUBTITLE_OFFSET_STEP = 0.25;
     const WEB_WATCH_NEXT_COUNTDOWN_MS = 15000;
+    // Short grace period after an episode genuinely finishes before advancing,
+    // mirroring the native player's unconditional end-of-episode autoplay.
+    const WEB_ENDED_NEXT_COUNTDOWN_MS = 5000;
     const WEB_NEXT_EPISODE_READY_TIMEOUT_MS = 45000;
     const WEB_MIN_REWIND_PAUSE_MS = 10000;
     const WEB_MIGRATION_STALL_MS = 15000;
@@ -1163,6 +1166,7 @@
     let nextEpisodePrequeuePolling = false;
     let nextEpisodePrequeuePollPromise = null;
     let playingNextEpisode = false;
+    let webPlayerPlaybackEnded = false;
     let webPlayerWatchNextAutoAdvanceBlocked = false;
     let webPlayerEpisodeTransitionActive = false;
     let hlsDuration = 0;
@@ -2362,6 +2366,7 @@
       });
       video.addEventListener('play', () => {
         webPlayerPausedAt = 0;
+        webPlayerPlaybackEnded = false;
         updateControls();
         renderSubtitles();
         startSubtitleRenderLoop(video);
@@ -2413,6 +2418,7 @@
         const genuinelyEnded = duration > 0 && duration - currentAbsoluteTime() <= 2;
         sendWebPlayerProgress({ force: true, isPaused: true, ended: genuinelyEnded });
         sendWebPlayerHLSState({ paused: true, ended: genuinelyEnded });
+        webPlayerPlaybackEnded = genuinelyEnded;
         updateUpNextVisibility({ forceNearEnd: genuinelyEnded });
       });
       // Buffering/stall detection: surface a live "Buffering" state to the
@@ -3540,11 +3546,16 @@
     }
 
     function ensureWatchNextCountdown() {
-      if (WATCH_PARTY_MODE || !webPlayerPromptConfirmed || !webAutoSkipEnabled('credits') || webPlayerWatchNextAutoAdvanceBlocked || upNextDismissed || playingNextEpisode) {
+      // A genuine end of playback always auto-advances (like the native player);
+      // the credits-marker countdown stays gated on the credits preference.
+      const creditsAdvance = webPlayerPromptConfirmed && webAutoSkipEnabled('credits');
+      if (WATCH_PARTY_MODE || !(creditsAdvance || webPlayerPlaybackEnded) || webPlayerWatchNextAutoAdvanceBlocked || upNextDismissed || playingNextEpisode) {
         clearWatchNextCountdown();
         return;
       }
-      if (!webPlayerWatchNextDeadline) webPlayerWatchNextDeadline = Date.now() + WEB_WATCH_NEXT_COUNTDOWN_MS;
+      const countdownMs = webPlayerPlaybackEnded ? WEB_ENDED_NEXT_COUNTDOWN_MS : WEB_WATCH_NEXT_COUNTDOWN_MS;
+      const proposedDeadline = Date.now() + countdownMs;
+      if (!webPlayerWatchNextDeadline || proposedDeadline < webPlayerWatchNextDeadline) webPlayerWatchNextDeadline = proposedDeadline;
       if (webPlayerWatchNextTimer) return;
       const tick = () => {
         const remaining = Math.max(0, webPlayerWatchNextDeadline - Date.now());
@@ -3720,7 +3731,7 @@
       const manualFallback = Boolean(options.forceNearEnd) || (duration > 0 && remaining <= WEB_NEAR_END_SECONDS && position > 0);
       const visible = webPlayerPromptConfirmed || manualFallback;
       host.classList.toggle('up-next-visible', visible);
-      if (visible && webPlayerPromptConfirmed) ensureWatchNextCountdown();
+      if (visible && (webPlayerPromptConfirmed || webPlayerPlaybackEnded)) ensureWatchNextCountdown();
       else clearWatchNextCountdown();
     }
 
@@ -3738,6 +3749,7 @@
       webPlayerSegmentGeneration += 1;
       webPlayerSegments = { recap: null, intro: null, outro: null };
       webPlayerPromptConfirmed = false;
+      webPlayerPlaybackEnded = false;
       webPlayerAutoSkipInProgress = false;
       nextEpisodeInfo = null;
       nextEpisodeLookupComplete = false;

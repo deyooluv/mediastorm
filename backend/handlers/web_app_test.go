@@ -233,6 +233,28 @@ func TestWebPlaybackTemplateSendsFinalHeartbeatOnTeardown(t *testing.T) {
 	}
 }
 
+func TestWebPlaybackTemplateAutoAdvancesAfterGenuineEpisodeEnd(t *testing.T) {
+	body, err := webTemplates.ReadFile("web_templates/playback.html")
+	if err != nil {
+		t.Fatalf("read web playback template: %v", err)
+	}
+
+	rendered := string(body)
+	for _, want := range []string{
+		"const WEB_ENDED_NEXT_COUNTDOWN_MS = 5000;",
+		"webPlayerPlaybackEnded = genuinelyEnded;",
+		"if (visible && (webPlayerPromptConfirmed || webPlayerPlaybackEnded)) ensureWatchNextCountdown();",
+		"!(creditsAdvance || webPlayerPlaybackEnded)",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("web playback template missing end-of-episode auto-advance hook %q", want)
+		}
+	}
+	if strings.Contains(rendered, "!webPlayerPromptConfirmed || !webAutoSkipEnabled('credits') ||") {
+		t.Fatal("watch-next countdown must not require a credits marker when playback genuinely ended")
+	}
+}
+
 func TestWebPlaybackTemplateShowsStreamDetailsOnlyForLivePlayback(t *testing.T) {
 	body, err := webTemplates.ReadFile("web_templates/playback.html")
 	if err != nil {
