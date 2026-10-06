@@ -85,8 +85,38 @@ type RealtimePlaybackObserver interface {
 
 // cachedSeriesMetadata holds cached series details with expiration.
 type cachedSeriesMetadata struct {
-	details   *models.SeriesDetails
+	details *models.SeriesDetails
+	// err is set for negative-cache entries: a recent lookup failed upstream and
+	// should not be retried until expiresAt.
+	err       error
 	cachedAt  time.Time
+	expiresAt time.Time
+}
+
+// seriesMetadataNegativeCacheTTL bounds how long a failed series metadata
+// lookup is remembered before the provider is retried.
+const seriesMetadataNegativeCacheTTL = 30 * time.Minute
+
+// seriesStatesCacheTTL is a safety net for the revision-keyed series state
+// cache. Revision keying handles every local mutation; the TTL only bounds
+// staleness from time-dependent inputs (air dates, metadata cache refresh).
+const seriesStatesCacheTTL = 5 * time.Minute
+
+// watchStateRevision identifies the inputs of a user's derived watch state.
+// Any mutation of the user's watch history or playback progress bumps user;
+// whole-store loads/clears and metadata-service swaps bump global; airtime
+// tracks TVmaze airtime refinements. Equal revisions mean equal inputs.
+type watchStateRevision struct {
+	user    uint64
+	global  uint64
+	airtime int64
+}
+
+// cachedSeriesStates holds a per-user ListSeriesStates result keyed by the
+// watch state revision it was built from.
+type cachedSeriesStates struct {
+	revision  watchStateRevision
+	items     []models.SeriesWatchState
 	expiresAt time.Time
 }
 
@@ -144,10 +174,18 @@ type Service struct {
 	metadataCacheTTL           time.Duration
 	continueWatchingCache      map[string]*cachedContinueWatching // userID -> continue watching
 	continueWatchingTTL        time.Duration
-	changeMu                   sync.RWMutex
-	watchStateChanged          func(userID string)
-	playbackProgressGate       chan struct{}
-	playbackProgressOnce       sync.Once
+	// Watch state revisions (protected by mu). watchStateSeq is a monotonically
+	// increasing sequence; userWatchStateRev records the sequence value of each
+	// user's latest mutation and globalWatchStateRev that of the latest
+	// whole-store change. See watchStateRevision.
+	watchStateSeq        uint64
+	userWatchStateRev    map[string]uint64
+	globalWatchStateRev  uint64
+	seriesStatesCache    map[string]*cachedSeriesStates // userID -> all series states
+	changeMu             sync.RWMutex
+	watchStateChanged    func(userID string)
+	playbackProgressGate chan struct{}
+	playbackProgressOnce sync.Once
 }
 
 type continueWatchingRevisionStats struct {
@@ -253,6 +291,7 @@ func (s *Service) SetMetadataService(metadataService MetadataService) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.metadataService = metadataService
+	s.bumpAllWatchStateRevisionsLocked()
 }
 
 // SetWatchStateChangedHook registers a callback invoked when a user's watch
@@ -265,7 +304,41 @@ func (s *Service) SetWatchStateChangedHook(fn func(userID string)) {
 
 func (s *Service) invalidateContinueWatchingLocked(userID string) {
 	delete(s.continueWatchingCache, userID)
+	s.bumpWatchStateRevisionLocked(userID)
 	s.notifyWatchStateChanged(userID)
+}
+
+// bumpWatchStateRevisionLocked records that userID's watch history or playback
+// progress changed, invalidating every revision-keyed derived cache for that
+// user. Callers must hold s.mu for writing. Bumping more often than strictly
+// necessary is harmless (it only costs a rebuild); missing a bump serves stale
+// state, so mutation paths bump on entry to the critical section.
+func (s *Service) bumpWatchStateRevisionLocked(userID string) {
+	if s.userWatchStateRev == nil {
+		s.userWatchStateRev = make(map[string]uint64)
+	}
+	s.watchStateSeq++
+	s.userWatchStateRev[userID] = s.watchStateSeq
+	delete(s.seriesStatesCache, userID)
+}
+
+// bumpAllWatchStateRevisionsLocked invalidates derived watch state for every
+// user (whole-store loads/clears, metadata service changes). Callers must hold
+// s.mu for writing.
+func (s *Service) bumpAllWatchStateRevisionsLocked() {
+	s.watchStateSeq++
+	s.globalWatchStateRev = s.watchStateSeq
+	s.seriesStatesCache = nil
+}
+
+// watchStateRevisionLocked returns the current revision of userID's derived
+// watch state inputs. Callers must hold s.mu (read or write).
+func (s *Service) watchStateRevisionLocked(userID string) watchStateRevision {
+	return watchStateRevision{
+		user:    s.userWatchStateRev[userID],
+		global:  s.globalWatchStateRev,
+		airtime: s.airtimeState.generation,
+	}
 }
 
 // invalidateContinueWatchingCacheLocked refreshes position-sensitive Continue
@@ -274,6 +347,7 @@ func (s *Service) invalidateContinueWatchingLocked(userID string) {
 // series used by the calendar.
 func (s *Service) invalidateContinueWatchingCacheLocked(userID string) {
 	delete(s.continueWatchingCache, userID)
+	s.bumpWatchStateRevisionLocked(userID)
 }
 
 func (s *Service) notifyWatchStateChanged(userID string) {
@@ -684,6 +758,7 @@ func (s *Service) ListContinueWatching(userID string) ([]models.SeriesWatchState
 	s.mu.RLock()
 	cached, exists := s.continueWatchingCache[userID]
 	generation := s.airtimeState.generation
+	revision := s.watchStateRevisionLocked(userID)
 	s.mu.RUnlock()
 
 	if exists && time.Now().Before(cached.expiresAt) {
@@ -698,9 +773,13 @@ func (s *Service) ListContinueWatching(userID string) ([]models.SeriesWatchState
 	}
 	items = filterRecordingContinueWatchingItems(items, recordingTitleSet)
 
-	// Cache the result
+	// Cache the result unless watch state changed while building; otherwise an
+	// in-flight build could re-populate the cache with pre-mutation state right
+	// after the mutation invalidated it.
 	s.mu.Lock()
-	s.cacheContinueWatchingLocked(userID, items, generation)
+	if s.watchStateRevisionLocked(userID) == revision {
+		s.cacheContinueWatchingLocked(userID, items, generation)
+	}
 	s.mu.Unlock()
 
 	return items, nil
@@ -944,10 +1023,114 @@ func (s *Service) ListSeriesStates(userID string) ([]models.SeriesWatchState, er
 		return nil, ErrUserIDRequired
 	}
 
-	// We don't cache "all series" states currently as it's typically used
-	// for the watchlist and we want the most fresh state.
+	// Callers (watchlist/shelf enrichment) want the freshest state, so the
+	// cache is keyed by the watch state revision: any history/progress
+	// mutation, store reload or airtime refinement produces a new revision and
+	// forces a rebuild. The TTL is only a safety net for time-dependent inputs.
+	s.mu.RLock()
+	revision := s.watchStateRevisionLocked(userID)
+	cached := s.seriesStatesCache[userID]
+	s.mu.RUnlock()
+	if cached != nil && cached.revision == revision && time.Now().Before(cached.expiresAt) {
+		return cloneSeriesWatchStates(cached.items), nil
+	}
+
 	ctx := context.Background()
-	return s.buildSeriesStatesFromHistory(ctx, userID, false)
+	items, err := s.buildSeriesStatesFromHistory(ctx, userID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	// Only cache when nothing changed while building: a concurrent mutation
+	// (or an identity repair performed by the build itself) means the result may
+	// reflect pre-mutation inputs.
+	if s.watchStateRevisionLocked(userID) == revision && s.metadataService != nil {
+		if s.seriesStatesCache == nil {
+			s.seriesStatesCache = make(map[string]*cachedSeriesStates)
+		}
+		s.seriesStatesCache[userID] = &cachedSeriesStates{
+			revision:  revision,
+			items:     cloneSeriesWatchStates(items),
+			expiresAt: s.seriesStatesExpiryLocked(userID, time.Now()),
+		}
+	}
+	s.mu.Unlock()
+
+	return items, nil
+}
+
+// seriesStatesExpiryLocked returns when a series state cache entry built now
+// must expire: the TTL safety net, or earlier if a live heartbeat overlaid on
+// playback progress will age out (changing ListPlaybackProgress output without
+// a mutation). Callers must hold s.mu.
+func (s *Service) seriesStatesExpiryLocked(userID string, now time.Time) time.Time {
+	expiresAt := now.Add(seriesStatesCacheTTL)
+	for _, progress := range s.activePlaybackProgress[userID] {
+		if activeExpiry := progress.UpdatedAt.Add(activeProgressTTL); activeExpiry.After(now) && activeExpiry.Before(expiresAt) {
+			expiresAt = activeExpiry
+		}
+	}
+	return expiresAt
+}
+
+// cloneSeriesWatchStates deep-copies series watch states so cached results
+// cannot be mutated by callers (or vice versa).
+func cloneSeriesWatchStates(items []models.SeriesWatchState) []models.SeriesWatchState {
+	if items == nil {
+		return nil
+	}
+	out := make([]models.SeriesWatchState, len(items))
+	for i, item := range items {
+		out[i] = cloneSeriesWatchState(item)
+	}
+	return out
+}
+
+func cloneSeriesWatchState(item models.SeriesWatchState) models.SeriesWatchState {
+	if item.BackdropURLs != nil {
+		item.BackdropURLs = append([]string(nil), item.BackdropURLs...)
+	}
+	if item.ExternalIDs != nil {
+		ids := make(map[string]string, len(item.ExternalIDs))
+		for k, v := range item.ExternalIDs {
+			ids[k] = v
+		}
+		item.ExternalIDs = ids
+	}
+	item.LastWatched = cloneEpisodeReference(item.LastWatched)
+	if item.NextEpisode != nil {
+		next := cloneEpisodeReference(*item.NextEpisode)
+		item.NextEpisode = &next
+	}
+	if item.WatchedEpisodes != nil {
+		eps := make(map[string]models.EpisodeReference, len(item.WatchedEpisodes))
+		for k, v := range item.WatchedEpisodes {
+			eps[k] = cloneEpisodeReference(v)
+		}
+		item.WatchedEpisodes = eps
+	}
+	if item.Theatrical != nil {
+		release := *item.Theatrical
+		item.Theatrical = &release
+	}
+	if item.HomeRelease != nil {
+		release := *item.HomeRelease
+		item.HomeRelease = &release
+	}
+	return item
+}
+
+func cloneEpisodeReference(ep models.EpisodeReference) models.EpisodeReference {
+	if ep.Numbering != nil {
+		numbering := *ep.Numbering
+		ep.Numbering = &numbering
+	}
+	if ep.Image != nil {
+		image := *ep.Image
+		ep.Image = &image
+	}
+	return ep
 }
 
 // buildSeriesStatesFromHistory generates watch state for series from watch history and playback progress.
@@ -2040,8 +2223,12 @@ func (s *Service) getSeriesMetadataWithCache(ctx context.Context, seriesID, seri
 	metadataSvc := s.metadataService
 	s.mu.RUnlock()
 
-	// Check cache validity
+	// Check cache validity (negative entries replay the recorded failure so a
+	// broken series does not hit the provider twice on every build).
 	if exists && time.Now().Before(cached.expiresAt) {
+		if cached.err != nil {
+			return nil, cached.err
+		}
 		return cached.details, nil
 	}
 
@@ -2103,7 +2290,20 @@ func (s *Service) getSeriesMetadataWithCache(ctx context.Context, seriesID, seri
 		log.Printf("[history] series metadata lite lookup failed for %q, falling back to full details: %v", seriesID, liteErr)
 		details, err = metadataSvc.SeriesDetails(ctx, query)
 		if err != nil {
-			return nil, fmt.Errorf("series metadata lite lookup failed: %v; full lookup failed: %w", liteErr, err)
+			lookupErr := fmt.Errorf("series metadata lite lookup failed: %v; full lookup failed: %w", liteErr, err)
+			// Don't remember failures caused by the caller's own cancellation or
+			// deadline; those say nothing about the series.
+			if ctx.Err() == nil {
+				now := time.Now()
+				s.mu.Lock()
+				s.metadataCache[seriesID] = &cachedSeriesMetadata{
+					err:       lookupErr,
+					cachedAt:  now,
+					expiresAt: now.Add(seriesMetadataNegativeCacheTTL),
+				}
+				s.mu.Unlock()
+			}
+			return nil, lookupErr
 		}
 	}
 
@@ -2415,6 +2615,7 @@ func (s *Service) ensureUserLocked(userID string) map[string]models.SeriesWatchS
 func (s *Service) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpAllWatchStateRevisionsLocked()
 
 	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -3176,6 +3377,7 @@ func (s *Service) ToggleWatched(userID string, update models.WatchHistoryUpdate)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	update = normalizeWatchHistoryUpdate(update)
 	if !isAddressableEpisodeUpdate(update.MediaType, update.ItemID, update.EpisodeNumber, update.ExternalIDs) {
@@ -3293,6 +3495,7 @@ func (s *Service) UpdateWatchHistory(userID string, update models.WatchHistoryUp
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	update = normalizeWatchHistoryUpdate(update)
 	if !isAddressableEpisodeUpdate(update.MediaType, update.ItemID, update.EpisodeNumber, update.ExternalIDs) {
@@ -3448,6 +3651,7 @@ func (s *Service) DeleteWatchHistoryItem(userID, mediaType, itemID string) error
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	perUser, ok := s.watchHistory[userID]
 	if !ok {
@@ -3486,6 +3690,7 @@ func (s *Service) DeleteWatchHistoryItem(userID, mediaType, itemID string) error
 func (s *Service) ClearWatchHistory() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpAllWatchStateRevisionsLocked()
 
 	count := 0
 	for _, perUser := range s.watchHistory {
@@ -3519,6 +3724,7 @@ func (s *Service) BulkUpdateScopedWatchHistory(userID string, updates []models.W
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	perUser := s.ensureWatchHistoryUserLocked(userID)
 	results := make([]models.WatchHistoryItem, 0, len(updates))
@@ -3679,6 +3885,7 @@ func (s *Service) ImportWatchHistory(userID string, updates []models.WatchHistor
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	perUser := s.ensureWatchHistoryUserLocked(userID)
 	now := time.Now().UTC()
@@ -4394,6 +4601,7 @@ func watchHistoryAbsoluteEpisodeDuplicateMatch(candidateEpisode, updateEpisode i
 func (s *Service) loadWatchHistory() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpAllWatchStateRevisionsLocked()
 
 	if s.useDB() {
 		loadStarted := time.Now()
@@ -5109,6 +5317,9 @@ func (s *Service) UpdatePlaybackProgressContext(ctx context.Context, userID stri
 	s.mu.Lock()
 	lockWait = time.Since(lockWaitStartedAt)
 	defer s.mu.Unlock()
+	// Bump on entry so every exit path (including early returns and persistence
+	// failures after in-memory changes) invalidates derived watch state.
+	s.bumpWatchStateRevisionLocked(userID)
 	if err := ctx.Err(); err != nil {
 		return models.PlaybackProgress{}, err
 	}
@@ -5553,9 +5764,10 @@ func (s *Service) ListPlaybackProgress(userID string) ([]models.PlaybackProgress
 		return nil, ErrUserIDRequired
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// Read under the shared lock so concurrent shelf requests don't serialize
+	// (or block progress writes). Expired live heartbeats are skipped here and
+	// only pruned below, under the write lock, when some actually exist.
+	s.mu.RLock()
 	now := time.Now()
 	merged := make(map[string]models.PlaybackProgress)
 	if perUser, ok := s.playbackProgress[userID]; ok {
@@ -5563,10 +5775,11 @@ func (s *Service) ListPlaybackProgress(userID string) ([]models.PlaybackProgress
 			merged[progress.ID] = progress
 		}
 	}
+	hasExpiredActive := false
 	if perUser, ok := s.activePlaybackProgress[userID]; ok {
-		for key, progress := range perUser {
+		for _, progress := range perUser {
 			if now.Sub(progress.UpdatedAt) > activeProgressTTL {
-				delete(perUser, key)
+				hasExpiredActive = true
 				continue
 			}
 			existing, ok := merged[progress.ID]
@@ -5578,7 +5791,7 @@ func (s *Service) ListPlaybackProgress(userID string) ([]models.PlaybackProgress
 			}
 		}
 		if len(perUser) == 0 {
-			delete(s.activePlaybackProgress, userID)
+			hasExpiredActive = true
 		}
 	}
 
@@ -5594,6 +5807,11 @@ func (s *Service) ListPlaybackProgress(userID string) ([]models.PlaybackProgress
 		}
 		items = append(items, copy)
 	}
+	s.mu.RUnlock()
+
+	if hasExpiredActive {
+		s.pruneExpiredActiveProgress(userID)
+	}
 
 	// Sort by most recently updated
 	sort.Slice(items, func(i, j int) bool {
@@ -5604,6 +5822,29 @@ func (s *Service) ListPlaybackProgress(userID string) ([]models.PlaybackProgress
 	})
 
 	return items, nil
+}
+
+// pruneExpiredActiveProgress drops live heartbeats older than activeProgressTTL
+// for userID. Expiry is re-checked under the write lock because a heartbeat may
+// have refreshed an entry since the caller observed it as expired. Pruning
+// does not change ListPlaybackProgress output (expired entries are already
+// ignored on read), so it does not bump the watch state revision.
+func (s *Service) pruneExpiredActiveProgress(userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	perUser, ok := s.activePlaybackProgress[userID]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	for key, progress := range perUser {
+		if now.Sub(progress.UpdatedAt) > activeProgressTTL {
+			delete(perUser, key)
+		}
+	}
+	if len(perUser) == 0 {
+		delete(s.activePlaybackProgress, userID)
+	}
 }
 
 func preferPlaybackProgress(candidate, existing models.PlaybackProgress) bool {
@@ -5729,6 +5970,7 @@ func (s *Service) DeletePlaybackProgress(userID, mediaType, itemID string) error
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	identity := mediaidentity.Resolve(mediaidentity.Input{MediaType: mediaType, ID: itemID})
 	removed := false
@@ -5774,6 +6016,7 @@ func (s *Service) DeletePlaybackProgress(userID, mediaType, itemID string) error
 func (s *Service) ClearPlaybackProgress() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpAllWatchStateRevisionsLocked()
 
 	count := 0
 	for _, perUser := range s.playbackProgress {
@@ -5802,6 +6045,7 @@ func (s *Service) ensurePlaybackProgressUserLocked(userID string) map[string]mod
 func (s *Service) loadPlaybackProgress() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpAllWatchStateRevisionsLocked()
 
 	if s.useDB() {
 		loadStarted := time.Now()
@@ -6323,6 +6567,7 @@ func (s *Service) HideFromContinueWatching(userID, seriesID string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.bumpWatchStateRevisionLocked(userID)
 
 	perUser := s.ensurePlaybackProgressUserLocked(userID)
 
