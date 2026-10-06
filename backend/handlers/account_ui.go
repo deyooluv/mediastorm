@@ -1423,9 +1423,9 @@ func (h *AccountUIHandler) StartTraktAuth(w http.ResponseWriter, r *http.Request
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	deviceCode, err := h.traktClient.GetDeviceCode()
+	deviceCode, err := tc.GetDeviceCode()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1476,9 +1476,9 @@ func (h *AccountUIHandler) CheckTraktAuth(w http.ResponseWriter, r *http.Request
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	token, err := h.traktClient.PollForToken(deviceCode)
+	token, err := tc.PollForToken(deviceCode)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1500,7 +1500,7 @@ func (h *AccountUIHandler) CheckTraktAuth(w http.ResponseWriter, r *http.Request
 	account.ExpiresAt = token.CreatedAt + int64(token.ExpiresIn)
 
 	// Get user profile
-	profile, err := h.traktClient.GetUserProfile(token.AccessToken)
+	profile, err := tc.GetUserProfile(token.AccessToken)
 	if err == nil && profile != nil {
 		account.Username = profile.Username
 		if account.Name == "" || account.Name == "Trakt Account" {

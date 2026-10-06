@@ -105,10 +105,7 @@ func (t *ScrobbleStateTracker) HandleProgressUpdate(userID string, update models
 		return
 	}
 
-	account := t.scrobbler.getAccountForUser(userID)
-	if account != nil {
-		t.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
+	client := t.client.ForAccount(t.scrobbler.getAccountForUser(userID))
 
 	req := buildScrobbleRequest(update, percentWatched)
 
@@ -121,7 +118,7 @@ func (t *ScrobbleStateTracker) HandleProgressUpdate(userID string, update models
 		// Transition to paused
 		if sess.state == stateWatching {
 			if _, err := scrobbleWithAbsoluteEpisodeFallback("pause", req, func(scrobbleReq ScrobbleRequest) (*ScrobbleResponse, error) {
-				return t.client.ScrobblePause(accessToken, scrobbleReq)
+				return client.ScrobblePause(accessToken, scrobbleReq)
 			}); err != nil {
 				if !isExpectedPauseProgressError(err) {
 					log.Printf("[trakt-scrobble] pause failed for %s: %v", key, err)
@@ -143,7 +140,7 @@ func (t *ScrobbleStateTracker) HandleProgressUpdate(userID string, update models
 			return
 		}
 		if _, err := scrobbleWithAbsoluteEpisodeFallback("start", req, func(scrobbleReq ScrobbleRequest) (*ScrobbleResponse, error) {
-			return t.client.ScrobbleStart(accessToken, scrobbleReq)
+			return client.ScrobbleStart(accessToken, scrobbleReq)
 		}); err != nil {
 			log.Printf("[trakt-scrobble] start failed for %s: %v", key, err)
 		} else {
@@ -155,7 +152,7 @@ func (t *ScrobbleStateTracker) HandleProgressUpdate(userID string, update models
 		// Re-send start periodically to keep "now watching" active
 		if now.Sub(sess.lastTraktCall) >= t.refreshInterval {
 			if _, err := scrobbleWithAbsoluteEpisodeFallback("refresh", req, func(scrobbleReq ScrobbleRequest) (*ScrobbleResponse, error) {
-				return t.client.ScrobbleStart(accessToken, scrobbleReq)
+				return client.ScrobbleStart(accessToken, scrobbleReq)
 			}); err != nil {
 				log.Printf("[trakt-scrobble] refresh failed for %s: %v", key, err)
 			} else {
@@ -189,14 +186,11 @@ func (t *ScrobbleStateTracker) StopSession(userID string, update models.Playback
 		return
 	}
 
-	account := t.scrobbler.getAccountForUser(userID)
-	if account != nil {
-		t.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
+	client := t.client.ForAccount(t.scrobbler.getAccountForUser(userID))
 
 	req := buildScrobbleRequest(update, percentWatched)
 	if _, err := scrobbleWithAbsoluteEpisodeFallback("stop", req, func(scrobbleReq ScrobbleRequest) (*ScrobbleResponse, error) {
-		return t.client.ScrobbleStop(accessToken, scrobbleReq)
+		return client.ScrobbleStop(accessToken, scrobbleReq)
 	}); err != nil {
 		log.Printf("[trakt-scrobble] stop failed for %s: %v", key, err)
 		return
@@ -212,13 +206,10 @@ func (t *ScrobbleStateTracker) CleanupRealtimeSession(_ context.Context, session
 		}
 		return err
 	}
-	account := t.scrobbler.getAccountForUser(session.UserID)
-	if account != nil {
-		t.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
+	client := t.client.ForAccount(t.scrobbler.getAccountForUser(session.UserID))
 	req := buildScrobbleRequest(session.Update, session.PercentWatched)
 	_, err = scrobbleWithAbsoluteEpisodeFallback("stop", req, func(scrobbleReq ScrobbleRequest) (*ScrobbleResponse, error) {
-		return t.client.ScrobbleStop(accessToken, scrobbleReq)
+		return client.ScrobbleStop(accessToken, scrobbleReq)
 	})
 	return err
 }

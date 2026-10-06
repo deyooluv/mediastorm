@@ -24,6 +24,8 @@ import (
 	"novastream/services/publicmetadb"
 	"novastream/services/simkl"
 	"novastream/services/trakt"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type metadataService interface {
@@ -1576,44 +1578,66 @@ func (h *MetadataHandler) resolveTraktShelfAccounts(user models.User, settings c
 }
 
 func (h *MetadataHandler) fetchTraktShelfItems(ctx context.Context, settings config.Settings, accounts []config.TraktAccount, listType, listID string) ([]traktShelfSourceItem, error) {
-	_ = ctx
+	_ = settings
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Fetch each account concurrently with its own credential-bound client.
+	// Never mutate the shared TraktClient's credentials here: Home loads
+	// several shelves (and accounts) at once, so in-place credential updates
+	// would race and could send one account's app key with another's token.
+	perAccount := make([][]traktShelfSourceItem, len(accounts))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
+	for i := range accounts {
+		accountCopy := accounts[i]
+		g.Go(func() error {
+			accessToken, err := h.TraktClient.EnsureValidToken(&accountCopy, h.CfgManager)
+			if err != nil {
+				return fmt.Errorf("validate trakt token for %s: %w", accountCopy.Name, err)
+			}
+			if accessToken == "" {
+				return nil
+			}
+			client := h.TraktClient.ForAccount(&accountCopy)
+
+			var normalizedItems []traktShelfSourceItem
+			switch listType {
+			case "watchlist":
+				watchlistItems, err := client.GetAllWatchlistCached(gctx, accountCopy.ID, accessToken)
+				if err != nil {
+					return fmt.Errorf("fetch trakt watchlist for %s: %w", accountCopy.Name, err)
+				}
+				for _, item := range watchlistItems {
+					if normalized, ok := normalizeTraktWatchlistItem(item); ok {
+						normalizedItems = append(normalizedItems, normalized)
+					}
+				}
+			case "custom":
+				listItems, err := client.GetAllListItemsCached(gctx, accountCopy.ID, accessToken, listID)
+				if err != nil {
+					return fmt.Errorf("fetch trakt list for %s: %w", accountCopy.Name, err)
+				}
+				for _, item := range listItems {
+					if normalized, ok := normalizeTraktCustomListItem(item); ok {
+						normalizedItems = append(normalizedItems, normalized)
+					}
+				}
+			}
+			perAccount[i] = normalizedItems
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Merge in account order so dedupe tie-breaking stays deterministic.
 	seen := make(map[string]traktShelfDedupeItem)
-
-	for _, account := range accounts {
-		accountCopy := account
-		accessToken, err := h.TraktClient.EnsureValidToken(&accountCopy, h.CfgManager)
-		if err != nil {
-			return nil, fmt.Errorf("validate trakt token for %s: %w", account.Name, err)
-		}
-		if accessToken == "" {
-			continue
-		}
-
-		h.TraktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
-
-		switch listType {
-		case "watchlist":
-			watchlistItems, err := h.TraktClient.GetAllWatchlist(accessToken)
-			if err != nil {
-				return nil, fmt.Errorf("fetch trakt watchlist for %s: %w", account.Name, err)
-			}
-			for _, item := range watchlistItems {
-				normalized, ok := normalizeTraktWatchlistItem(item)
-				if ok {
-					upsertTraktShelfItem(seen, normalized)
-				}
-			}
-		case "custom":
-			listItems, err := h.TraktClient.GetAllListItems(accessToken, listID)
-			if err != nil {
-				return nil, fmt.Errorf("fetch trakt list for %s: %w", account.Name, err)
-			}
-			for _, item := range listItems {
-				normalized, ok := normalizeTraktCustomListItem(item)
-				if ok {
-					upsertTraktShelfItem(seen, normalized)
-				}
-			}
+	for _, accountItems := range perAccount {
+		for _, item := range accountItems {
+			upsertTraktShelfItem(seen, item)
 		}
 	}
 

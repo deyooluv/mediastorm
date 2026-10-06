@@ -96,14 +96,11 @@ func (s *Scrobbler) ScrobbleMovie(userID string, tmdbID, tvdbID int, imdbID stri
 		return err
 	}
 
-	// Set client credentials for this account
-	account := s.getAccountForUser(userID)
-	if account != nil {
-		s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
+	// Use a client bound to this account's credentials
+	client := s.client.ForAccount(s.getAccountForUser(userID))
 
 	watchedAtStr := watchedAt.UTC().Format(time.RFC3339)
-	return s.client.AddMovieToHistory(accessToken, tmdbID, tvdbID, imdbID, watchedAtStr)
+	return client.AddMovieToHistory(accessToken, tmdbID, tvdbID, imdbID, watchedAtStr)
 }
 
 // ScrobbleEpisode syncs a watched episode to Trakt using any available show ID
@@ -126,15 +123,12 @@ func (s *Scrobbler) ScrobbleEpisode(userID string, showTVDBID, season, episode i
 		return err
 	}
 
-	// Set client credentials for this account
-	account := s.getAccountForUser(userID)
-	if account != nil {
-		s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
+	// Use a client bound to this account's credentials
+	client := s.client.ForAccount(s.getAccountForUser(userID))
 
 	watchedAtStr := watchedAt.UTC().Format(time.RFC3339)
 	episodeIDs := episodeSyncIDs(externalIDs)
-	err = s.client.AddEpisodeToHistoryForShow(accessToken, showIDs, season, episode, watchedAtStr, episodeIDs)
+	err = client.AddEpisodeToHistoryForShow(accessToken, showIDs, season, episode, watchedAtStr, episodeIDs)
 	if !errors.Is(err, ErrNotFound) {
 		return err
 	}
@@ -144,7 +138,7 @@ func (s *Scrobbler) ScrobbleEpisode(userID string, showTVDBID, season, episode i
 		return err
 	}
 	log.Printf("[trakt] canonical history scrobble failed for S%02dE%02d; retrying absolute episode %d", season, episode, absoluteEpisode)
-	return s.client.AddEpisodeToHistoryForShow(accessToken, showIDs, season, absoluteEpisode, watchedAtStr, episodeIDs)
+	return client.AddEpisodeToHistoryForShow(accessToken, showIDs, season, absoluteEpisode, watchedAtStr, episodeIDs)
 }
 
 func (s *Scrobbler) UnscrobbleMovie(userID string, tmdbID, tvdbID int, imdbID string) error {
@@ -155,11 +149,8 @@ func (s *Scrobbler) UnscrobbleMovie(userID string, tmdbID, tvdbID int, imdbID st
 	if err != nil || accessToken == "" {
 		return err
 	}
-	account := s.getAccountForUser(userID)
-	if account != nil {
-		s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
-	_, err = s.client.RemoveFromHistory(accessToken, SyncHistoryRequest{Movies: []SyncMovie{{
+	client := s.client.ForAccount(s.getAccountForUser(userID))
+	_, err = client.RemoveFromHistory(accessToken, SyncHistoryRequest{Movies: []SyncMovie{{
 		IDs: SyncIDs{TMDB: tmdbID, TVDB: tvdbID, IMDB: imdbID},
 	}}})
 	return err
@@ -177,11 +168,8 @@ func (s *Scrobbler) UnscrobbleEpisode(userID string, showTVDBID, season, episode
 	if err != nil || accessToken == "" {
 		return err
 	}
-	account := s.getAccountForUser(userID)
-	if account != nil {
-		s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
-	}
-	resp, err := s.client.RemoveFromHistory(accessToken, SyncHistoryRequest{Shows: []SyncShow{{
+	client := s.client.ForAccount(s.getAccountForUser(userID))
+	resp, err := client.RemoveFromHistory(accessToken, SyncHistoryRequest{Shows: []SyncShow{{
 		IDs: showIDs,
 		Seasons: []SyncSeason{{Number: season, Episodes: []SyncEpisode{{
 			Number: episode,
@@ -196,7 +184,7 @@ func (s *Scrobbler) UnscrobbleEpisode(userID string, showTVDBID, season, episode
 		return nil
 	}
 	log.Printf("[trakt] canonical history removal failed for S%02dE%02d; retrying absolute episode %d", season, episode, absoluteEpisode)
-	_, err = s.client.RemoveFromHistory(accessToken, SyncHistoryRequest{Shows: []SyncShow{{
+	_, err = client.RemoveFromHistory(accessToken, SyncHistoryRequest{Shows: []SyncShow{{
 		IDs: showIDs,
 		Seasons: []SyncSeason{{Number: season, Episodes: []SyncEpisode{{
 			Number: absoluteEpisode,
@@ -245,9 +233,9 @@ func (s *Scrobbler) ScrobbleMovieLegacy(tmdbID, tvdbID int, imdbID string, watch
 	// Find first account with scrobbling enabled
 	for _, account := range settings.Trakt.Accounts {
 		if account.ScrobblingEnabled && account.AccessToken != "" {
-			s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
+			client := s.client.WithCredentials(account.ClientID, account.ClientSecret)
 			watchedAtStr := watchedAt.UTC().Format(time.RFC3339)
-			return s.client.AddMovieToHistory(account.AccessToken, tmdbID, tvdbID, imdbID, watchedAtStr)
+			return client.AddMovieToHistory(account.AccessToken, tmdbID, tvdbID, imdbID, watchedAtStr)
 		}
 	}
 
@@ -265,9 +253,9 @@ func (s *Scrobbler) ScrobbleEpisodeLegacy(showTVDBID, season, episode int, watch
 	// Find first account with scrobbling enabled
 	for _, account := range settings.Trakt.Accounts {
 		if account.ScrobblingEnabled && account.AccessToken != "" {
-			s.client.UpdateCredentials(account.ClientID, account.ClientSecret)
+			client := s.client.WithCredentials(account.ClientID, account.ClientSecret)
 			watchedAtStr := watchedAt.UTC().Format(time.RFC3339)
-			return s.client.AddEpisodeToHistory(account.AccessToken, showTVDBID, season, episode, watchedAtStr, SyncIDs{})
+			return client.AddEpisodeToHistory(account.AccessToken, showTVDBID, season, episode, watchedAtStr, SyncIDs{})
 		}
 	}
 

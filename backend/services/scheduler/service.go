@@ -1275,8 +1275,8 @@ func (s *Service) executeTraktListSync(task config.ScheduledTask) (SyncResult, e
 	}
 	traktAccount.AccessToken = accessToken
 
-	// Update client with account credentials
-	s.traktClient.UpdateCredentials(traktAccount.ClientID, traktAccount.ClientSecret)
+	// Per-account credentials are bound via s.traktFor(traktAccount) in the
+	// sync helpers; the shared client's credentials are never mutated.
 
 	// Build sync source identifier for tracking
 	syncSource := fmt.Sprintf("trakt:%s:%s:%s", traktAccountID, listType, task.ID)
@@ -1293,6 +1293,13 @@ func (s *Service) executeTraktListSync(task config.ScheduledTask) (SyncResult, e
 	}
 }
 
+// traktFor returns a Trakt client bound to the account's app credentials. The
+// shared client is used by handlers and background jobs concurrently, so its
+// credentials must never be mutated in place.
+func (s *Service) traktFor(account *config.TraktAccount) *trakt.Client {
+	return s.traktClient.ForAccount(account)
+}
+
 // TraktListItem is a unified representation of items from different Trakt list types
 type TraktListItem struct {
 	Title     string
@@ -1302,12 +1309,12 @@ type TraktListItem struct {
 }
 
 // getTraktListItems fetches items from the specified Trakt list type
-func (s *Service) getTraktListItems(accessToken string, listType string, customListID string) ([]TraktListItem, error) {
+func (s *Service) getTraktListItems(client *trakt.Client, accessToken string, listType string, customListID string) ([]TraktListItem, error) {
 	var items []TraktListItem
 
 	switch listType {
 	case "watchlist":
-		watchlistItems, err := s.traktClient.GetAllWatchlist(accessToken)
+		watchlistItems, err := client.GetAllWatchlist(accessToken)
 		if err != nil {
 			return nil, fmt.Errorf("get trakt watchlist: %w", err)
 		}
@@ -1330,7 +1337,7 @@ func (s *Service) getTraktListItems(accessToken string, listType string, customL
 		}
 
 	case "collection":
-		collectionItems, err := s.traktClient.GetAllCollection(accessToken)
+		collectionItems, err := client.GetAllCollection(accessToken)
 		if err != nil {
 			return nil, fmt.Errorf("get trakt collection: %w", err)
 		}
@@ -1353,7 +1360,7 @@ func (s *Service) getTraktListItems(accessToken string, listType string, customL
 		}
 
 	case "favorites":
-		favoriteItems, err := s.traktClient.GetAllFavorites(accessToken)
+		favoriteItems, err := client.GetAllFavorites(accessToken)
 		if err != nil {
 			return nil, fmt.Errorf("get trakt favorites: %w", err)
 		}
@@ -1379,7 +1386,7 @@ func (s *Service) getTraktListItems(accessToken string, listType string, customL
 		if customListID == "" {
 			return nil, errors.New("custom list ID is required for custom list sync")
 		}
-		listItems, err := s.traktClient.GetAllListItems(accessToken, customListID)
+		listItems, err := client.GetAllListItems(accessToken, customListID)
 		if err != nil {
 			return nil, fmt.Errorf("get trakt custom list: %w", err)
 		}
@@ -1414,7 +1421,7 @@ func (s *Service) syncTraktToLocal(traktAccount *config.TraktAccount, profileID,
 	result := SyncResult{DryRun: dryRun}
 
 	// Fetch items from Trakt list
-	items, err := s.getTraktListItems(traktAccount.AccessToken, listType, customListID)
+	items, err := s.getTraktListItems(s.traktFor(traktAccount), traktAccount.AccessToken, listType, customListID)
 	if err != nil {
 		return result, err
 	}
@@ -1532,7 +1539,7 @@ func (s *Service) syncLocalToTrakt(traktAccount *config.TraktAccount, profileID,
 	}
 
 	// Get current Trakt watchlist to check what's already there
-	traktItems, err := s.traktClient.GetAllWatchlist(traktAccount.AccessToken)
+	traktItems, err := s.traktFor(traktAccount).GetAllWatchlist(traktAccount.AccessToken)
 	if err != nil {
 		return result, fmt.Errorf("fetch trakt watchlist: %w", err)
 	}
@@ -1635,7 +1642,11 @@ func (s *Service) syncLocalToTrakt(traktAccount *config.TraktAccount, profileID,
 
 	// Add items to Trakt
 	if !dryRun && (len(moviesToAdd) > 0 || len(showsToAdd) > 0) {
-		if err := s.traktClient.AddToWatchlist(traktAccount.AccessToken, moviesToAdd, showsToAdd); err != nil {
+		err := s.traktFor(traktAccount).AddToWatchlist(traktAccount.AccessToken, moviesToAdd, showsToAdd)
+		// Drop cached Home-shelf data for this account; even a failed call may
+		// have partially applied.
+		s.traktClient.InvalidateListCache(traktAccount.ID)
+		if err != nil {
 			return result, fmt.Errorf("add to trakt watchlist: %w", err)
 		}
 		log.Printf("[scheduler] Added %d movies and %d shows to Trakt watchlist", len(moviesToAdd), len(showsToAdd))
@@ -1729,7 +1740,9 @@ func (s *Service) syncLocalToTrakt(traktAccount *config.TraktAccount, profileID,
 		}
 
 		if !dryRun && (len(moviesToRemove) > 0 || len(showsToRemove) > 0) {
-			if err := s.traktClient.RemoveFromWatchlist(traktAccount.AccessToken, moviesToRemove, showsToRemove); err != nil {
+			err := s.traktFor(traktAccount).RemoveFromWatchlist(traktAccount.AccessToken, moviesToRemove, showsToRemove)
+			s.traktClient.InvalidateListCache(traktAccount.ID)
+			if err != nil {
 				log.Printf("[scheduler] Failed to remove items from Trakt watchlist: %v", err)
 			} else {
 				log.Printf("[scheduler] Removed %d items from Trakt watchlist", removed)
@@ -1747,7 +1760,7 @@ func (s *Service) syncTraktBidirectional(traktAccount *config.TraktAccount, prof
 	result := SyncResult{DryRun: dryRun}
 
 	// Get both lists
-	traktItems, err := s.getTraktListItems(traktAccount.AccessToken, listType, customListID)
+	traktItems, err := s.getTraktListItems(s.traktFor(traktAccount), traktAccount.AccessToken, listType, customListID)
 	if err != nil {
 		return result, err
 	}
@@ -1879,7 +1892,9 @@ func (s *Service) syncTraktBidirectional(traktAccount *config.TraktAccount, prof
 		}
 
 		if !dryRun && (len(moviesToAdd) > 0 || len(showsToAdd) > 0) {
-			if err := s.traktClient.AddToWatchlist(traktAccount.AccessToken, moviesToAdd, showsToAdd); err != nil {
+			err := s.traktFor(traktAccount).AddToWatchlist(traktAccount.AccessToken, moviesToAdd, showsToAdd)
+			s.traktClient.InvalidateListCache(traktAccount.ID)
+			if err != nil {
 				log.Printf("[scheduler] Failed to add items to Trakt watchlist: %v", err)
 			} else {
 				log.Printf("[scheduler] Exported %d movies and %d shows to Trakt watchlist", len(moviesToAdd), len(showsToAdd))
@@ -2078,8 +2093,8 @@ func (s *Service) executeTraktHistorySync(task config.ScheduledTask) (SyncResult
 	}
 	traktAccount.AccessToken = accessToken
 
-	// Update client with account credentials
-	s.traktClient.UpdateCredentials(traktAccount.ClientID, traktAccount.ClientSecret)
+	// Per-account credentials are bound via s.traktFor(traktAccount) in the
+	// sync helpers; the shared client's credentials are never mutated.
 
 	switch syncDirection {
 	case "trakt_to_local":
@@ -2144,7 +2159,7 @@ func (s *Service) syncTraktHistoryToLocal(task config.ScheduledTask, traktAccoun
 
 	log.Printf("[scheduler] Fetching Trakt watch history since=%v (fullSync=%v)", since, isFullSync)
 
-	items, err := s.traktClient.GetWatchHistorySince(traktAccount.AccessToken, since)
+	items, err := s.traktFor(traktAccount).GetWatchHistorySince(traktAccount.AccessToken, since)
 	if err != nil {
 		return result, fmt.Errorf("fetch trakt history: %w", err)
 	}
@@ -2243,7 +2258,7 @@ func (s *Service) syncLocalHistoryToTrakt(task config.ScheduledTask, traktAccoun
 
 	// Fetch existing Trakt history to avoid creating duplicate watch events.
 	// Trakt's AddToHistory creates a NEW event each call — it is not idempotent.
-	traktItems, err := s.traktClient.GetWatchHistorySince(traktAccount.AccessToken, since)
+	traktItems, err := s.traktFor(traktAccount).GetWatchHistorySince(traktAccount.AccessToken, since)
 	if err != nil {
 		return result, fmt.Errorf("fetch trakt history for dedup: %w", err)
 	}
@@ -2264,7 +2279,7 @@ func (s *Service) syncLocalHistoryToTrakt(task config.ScheduledTask, traktAccoun
 	// stale Trakt watched rows instead of missing them outside the incremental window.
 	deletionTraktItems := traktItems
 	if hasRecentLocalUnwatch && !since.IsZero() {
-		deletionTraktItems, err = s.traktClient.GetWatchHistorySince(traktAccount.AccessToken, time.Time{})
+		deletionTraktItems, err = s.traktFor(traktAccount).GetWatchHistorySince(traktAccount.AccessToken, time.Time{})
 		if err != nil {
 			return result, fmt.Errorf("fetch full trakt history for unwatch sync: %w", err)
 		}
@@ -2514,7 +2529,7 @@ func (s *Service) syncLocalHistoryToTrakt(task config.ScheduledTask, traktAccoun
 			Movies: removeMovies,
 			Shows:  removeShows,
 		}
-		resp, err := s.traktClient.RemoveFromHistory(traktAccount.AccessToken, removeReq)
+		resp, err := s.traktFor(traktAccount).RemoveFromHistory(traktAccount.AccessToken, removeReq)
 		if err != nil {
 			return result, fmt.Errorf("remove from trakt history: %w", err)
 		}
@@ -2529,7 +2544,7 @@ func (s *Service) syncLocalHistoryToTrakt(task config.ScheduledTask, traktAccoun
 			Movies: movies,
 			Shows:  shows,
 		}
-		resp, err := s.traktClient.AddToHistory(traktAccount.AccessToken, syncReq)
+		resp, err := s.traktFor(traktAccount).AddToHistory(traktAccount.AccessToken, syncReq)
 		if err != nil {
 			return result, fmt.Errorf("add to trakt history: %w", err)
 		}
@@ -2555,7 +2570,7 @@ func (s *Service) syncLocalHistoryToTrakt(task config.ScheduledTask, traktAccoun
 		if len(retryEpisodes) > 0 {
 			absoluteShows := buildShows(retryEpisodes, showIDs)
 			retryReq := trakt.SyncHistoryRequest{Shows: absoluteShows}
-			retryResp, retryErr := s.traktClient.AddToHistory(traktAccount.AccessToken, retryReq)
+			retryResp, retryErr := s.traktFor(traktAccount).AddToHistory(traktAccount.AccessToken, retryReq)
 			if retryErr != nil {
 				return result, fmt.Errorf("Trakt absolute episode retry: %w", retryErr)
 			} else {
@@ -2963,7 +2978,6 @@ func (s *Service) syncPlaybackToTrakt(traktAccount *config.TraktAccount, profile
 		return exported, fmt.Errorf("list playback progress: %w", err)
 	}
 
-	s.traktClient.UpdateCredentials(traktAccount.ClientID, traktAccount.ClientSecret)
 	accessToken := traktAccount.AccessToken
 	var moviesToHistory []trakt.SyncMovie
 	type playbackShowKey struct {
@@ -3061,13 +3075,13 @@ func (s *Service) syncPlaybackToTrakt(traktAccount *config.TraktAccount, profile
 		}
 
 		// ScrobblePause saves the position on Trakt without adding a watched event.
-		_, syncErr := s.traktClient.ScrobblePause(accessToken, req)
+		_, syncErr := s.traktFor(traktAccount).ScrobblePause(accessToken, req)
 		if errors.Is(syncErr, trakt.ErrNotFound) && req.Episode != nil && req.Episode.NumberAbs > 0 && req.Episode.NumberAbs != req.Episode.Number {
 			fallbackReq := req
 			episode := *req.Episode
 			episode.Number = episode.NumberAbs
 			fallbackReq.Episode = &episode
-			_, syncErr = s.traktClient.ScrobblePause(accessToken, fallbackReq)
+			_, syncErr = s.traktFor(traktAccount).ScrobblePause(accessToken, fallbackReq)
 			if syncErr == nil {
 				log.Printf("[scheduler] Synced playback for %s using Trakt absolute episode number %d", item.ItemID, episode.Number)
 			}
@@ -3104,7 +3118,7 @@ func (s *Service) syncPlaybackToTrakt(traktAccount *config.TraktAccount, profile
 			Movies: moviesToHistory,
 			Shows:  shows,
 		}
-		if _, err := s.traktClient.AddToHistory(traktAccount.AccessToken, syncReq); err != nil {
+		if _, err := s.traktFor(traktAccount).AddToHistory(traktAccount.AccessToken, syncReq); err != nil {
 			return exported, fmt.Errorf("add high-progress playback to trakt history: %w", err)
 		}
 	}
@@ -3124,7 +3138,6 @@ func (s *Service) syncPlaybackFromTrakt(traktAccount *config.TraktAccount, profi
 		return importedKeys, nil
 	}
 
-	s.traktClient.UpdateCredentials(traktAccount.ClientID, traktAccount.ClientSecret)
 	accessToken := traktAccount.AccessToken
 
 	// Build a reverse index from IMDB ID → local itemID for existing movie progress.
@@ -3145,7 +3158,7 @@ func (s *Service) syncPlaybackFromTrakt(traktAccount *config.TraktAccount, profi
 	watchedImported := 0
 
 	for _, mediaType := range []string{"movies", "episodes"} {
-		traktItems, err := s.traktClient.GetPlaybackProgress(accessToken, mediaType)
+		traktItems, err := s.traktFor(traktAccount).GetPlaybackProgress(accessToken, mediaType)
 		if err != nil {
 			log.Printf("[scheduler] Failed to get Trakt playback progress for %s: %v", mediaType, err)
 			continue
@@ -3196,7 +3209,7 @@ func (s *Service) syncPlaybackFromTrakt(traktAccount *config.TraktAccount, profi
 			hiddenMarker := s.findHiddenPlaybackMarker(profileID, *update)
 			if hiddenMarker != nil && !traktItem.PausedAt.After(hiddenMarker.UpdatedAt) {
 				if traktItem.ID > 0 {
-					if err := s.traktClient.RemovePlaybackItem(accessToken, traktItem.ID); err != nil {
+					if err := s.traktFor(traktAccount).RemovePlaybackItem(accessToken, traktItem.ID); err != nil {
 						log.Printf("[scheduler] Failed to remove hidden Trakt playback item %d for %s %s: %v",
 							traktItem.ID, update.MediaType, update.ItemID, err)
 					} else {
@@ -3242,7 +3255,7 @@ func (s *Service) syncPlaybackFromTrakt(traktAccount *config.TraktAccount, profi
 			if localProgress != nil {
 				if localProgress.HiddenFromContinueWatching && !traktItem.PausedAt.After(localProgress.UpdatedAt) {
 					if traktItem.ID > 0 {
-						if err := s.traktClient.RemovePlaybackItem(accessToken, traktItem.ID); err != nil {
+						if err := s.traktFor(traktAccount).RemovePlaybackItem(accessToken, traktItem.ID); err != nil {
 							log.Printf("[scheduler] Failed to remove hidden Trakt playback item %d for %s %s: %v",
 								traktItem.ID, update.MediaType, update.ItemID, err)
 						} else {

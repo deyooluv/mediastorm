@@ -22,8 +22,7 @@ func (s *Scrobbler) SyncWatchHistory(userID string, items []models.WatchHistoryI
 		return nil
 	}
 	// Keep account credentials local to this operation.
-	client := NewClient(account.ClientID, account.ClientSecret)
-	client.httpClient = s.client.httpClient
+	client := s.client.ForAccount(account)
 	for _, group := range watchsync.Groups(items) {
 		for start := 0; start < len(group); start += watchsync.BatchSize {
 			chunk := group[start:min(start+watchsync.BatchSize, len(group))]

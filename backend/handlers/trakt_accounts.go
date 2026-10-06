@@ -368,9 +368,9 @@ func (h *TraktAccountsHandler) StartAuth(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	deviceCode, err := h.traktClient.GetDeviceCode()
+	deviceCode, err := tc.GetDeviceCode()
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -413,9 +413,9 @@ func (h *TraktAccountsHandler) CheckAuth(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	token, err := h.traktClient.PollForToken(deviceCode)
+	token, err := tc.PollForToken(deviceCode)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -437,7 +437,7 @@ func (h *TraktAccountsHandler) CheckAuth(w http.ResponseWriter, r *http.Request)
 	account.ExpiresAt = token.CreatedAt + int64(token.ExpiresIn)
 
 	// Get user profile
-	profile, err := h.traktClient.GetUserProfile(token.AccessToken)
+	profile, err := tc.GetUserProfile(token.AccessToken)
 	if err == nil && profile != nil {
 		account.Username = profile.Username
 		if account.Name == "" || account.Name == "Trakt Account" {
@@ -583,9 +583,9 @@ func (h *TraktAccountsHandler) GetWatchlist(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	items, err := h.traktClient.GetAllWatchlist(accessToken)
+	items, err := tc.GetAllWatchlist(accessToken)
 	if err != nil {
 		jsonError(w, "Failed to fetch watchlist: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -654,11 +654,11 @@ func (h *TraktAccountsHandler) GetHistory(w http.ResponseWriter, r *http.Request
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
 	// Check if all items requested
 	if r.URL.Query().Get("all") == "true" {
-		items, err := h.traktClient.GetAllWatchHistory(accessToken)
+		items, err := tc.GetAllWatchHistory(accessToken)
 		if err != nil {
 			jsonError(w, "Failed to fetch history: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -688,7 +688,7 @@ func (h *TraktAccountsHandler) GetHistory(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	items, totalCount, err := h.traktClient.GetWatchHistory(accessToken, page, limit, "")
+	items, totalCount, err := tc.GetWatchHistory(accessToken, page, limit, "")
 	if err != nil {
 		jsonError(w, "Failed to fetch history: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -776,14 +776,14 @@ func (h *TraktAccountsHandler) GetLists(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Update client with account credentials
-	h.traktClient.UpdateCredentials(account.ClientID, account.ClientSecret)
+	tc := h.traktClient.WithCredentials(account.ClientID, account.ClientSecret)
 
-	lists, err := h.traktClient.GetUserLists(accessToken)
+	lists, err := tc.GetUserLists(accessToken)
 	if err != nil {
 		jsonError(w, "Failed to fetch lists: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	smartLists, err := h.traktClient.GetUserSmartLists(accessToken)
+	smartLists, err := tc.GetUserSmartLists(accessToken)
 	if err != nil {
 		jsonError(w, "Failed to fetch smart lists: "+err.Error(), http.StatusInternalServerError)
 		return

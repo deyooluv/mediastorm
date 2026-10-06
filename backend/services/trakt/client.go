@@ -2,6 +2,7 @@ package trakt
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,15 +48,40 @@ func (c *Client) SetHTTPClientForTest(httpClient *http.Client) {
 	}
 }
 
-// Client handles Trakt API interactions for OAuth and data fetching
+// Client handles Trakt API interactions for OAuth and data fetching.
+//
+// A single base Client is shared process-wide, but Trakt credentials
+// (client ID/secret) are per Trakt account. Concurrent callers must NOT mutate
+// the shared client's credentials; instead derive a request-scoped client with
+// WithCredentials, which shares the HTTP client, refresh locks and list cache
+// with its parent but carries its own immutable credentials.
 type Client struct {
-	httpClient   *http.Client
+	httpClient *http.Client
+
+	credMu       sync.RWMutex
 	clientID     string
 	clientSecret string
 
+	// shared holds state common to a base client and all clients derived
+	// from it via WithCredentials.
+	shared *clientShared
+}
+
+// clientShared is state shared between a base client and derived clients.
+type clientShared struct {
 	// Per-account mutexes for coordinating token refresh
 	refreshMuMap   map[string]*sync.Mutex
 	refreshMuGuard sync.Mutex
+
+	// lists caches list/watchlist fetch results for Home shelves.
+	lists *listCache
+}
+
+func newClientShared() *clientShared {
+	return &clientShared{
+		refreshMuMap: make(map[string]*sync.Mutex),
+		lists:        newListCache(DefaultListCacheTTL),
+	}
 }
 
 // DeviceCodeResponse represents the response from /oauth/device/code
@@ -146,21 +172,58 @@ func NewClient(clientID, clientSecret string) *Client {
 		httpClient:   apiusage.TrackClient(&http.Client{Timeout: 30 * time.Second}, "Trakt", "API request"),
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		refreshMuMap: make(map[string]*sync.Mutex),
+		shared:       newClientShared(),
 	}
+}
+
+// WithCredentials returns a lightweight client bound to the given Trakt app
+// credentials. It shares the HTTP client, token-refresh locks and list cache
+// with c, so it is cheap to create per request/account. Use this instead of
+// UpdateCredentials on any path that may run concurrently.
+func (c *Client) WithCredentials(clientID, clientSecret string) *Client {
+	if c == nil {
+		return nil
+	}
+	return &Client{
+		httpClient:   c.httpClient,
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		shared:       c.shared,
+	}
+}
+
+// ForAccount returns a client bound to the account's Trakt app credentials.
+func (c *Client) ForAccount(account *config.TraktAccount) *Client {
+	if account == nil {
+		return c
+	}
+	return c.WithCredentials(account.ClientID, account.ClientSecret)
+}
+
+// credentials returns the client's current app credentials.
+func (c *Client) credentials() (clientID, clientSecret string) {
+	c.credMu.RLock()
+	defer c.credMu.RUnlock()
+	return c.clientID, c.clientSecret
 }
 
 // getRefreshMu returns the per-account mutex for token refresh coordination.
 func (c *Client) getRefreshMu(accountID string) *sync.Mutex {
-	c.refreshMuGuard.Lock()
-	defer c.refreshMuGuard.Unlock()
-	if c.refreshMuMap == nil {
-		c.refreshMuMap = make(map[string]*sync.Mutex)
+	sh := c.shared
+	if sh == nil {
+		// Client not built via NewClient; fall back to a lock local to this
+		// call (no cross-goroutine serialization possible without shared state).
+		return &sync.Mutex{}
 	}
-	mu, ok := c.refreshMuMap[accountID]
+	sh.refreshMuGuard.Lock()
+	defer sh.refreshMuGuard.Unlock()
+	if sh.refreshMuMap == nil {
+		sh.refreshMuMap = make(map[string]*sync.Mutex)
+	}
+	mu, ok := sh.refreshMuMap[accountID]
 	if !ok {
 		mu = &sync.Mutex{}
-		c.refreshMuMap[accountID] = mu
+		sh.refreshMuMap[accountID] = mu
 	}
 	return mu
 }
@@ -208,11 +271,13 @@ func (c *Client) EnsureValidToken(account *config.TraktAccount, configManager *c
 		return freshAccount.AccessToken, nil
 	}
 
-	// We still need to refresh — set credentials and call Trakt
-	c.UpdateCredentials(freshAccount.ClientID, freshAccount.ClientSecret)
-
+	// We still need to refresh — use a client bound to this account's
+	// credentials (never mutate the shared client's credentials).
+	// The refresh deliberately ignores request cancellation: Trakt refresh
+	// tokens are single-use, so abandoning a refresh after Trakt consumed the
+	// token but before we persist the new one would break the account.
 	log.Printf("[trakt] Refreshing token for account %s (%s)", freshAccount.Name, freshAccount.ID)
-	token, err := c.RefreshAccessToken(freshAccount.RefreshToken)
+	token, err := c.WithCredentials(freshAccount.ClientID, freshAccount.ClientSecret).RefreshAccessToken(freshAccount.RefreshToken)
 	if err != nil {
 		return "", fmt.Errorf("refresh trakt token: %w", err)
 	}
@@ -239,7 +304,8 @@ func (c *Client) EnsureValidToken(account *config.TraktAccount, configManager *c
 func (c *Client) setTraktHeaders(req *http.Request, accessToken string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("trakt-api-version", traktAPIVersion)
-	req.Header.Set("trakt-api-key", c.clientID)
+	clientID, _ := c.credentials()
+	req.Header.Set("trakt-api-key", clientID)
 	if accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 	}
@@ -247,8 +313,9 @@ func (c *Client) setTraktHeaders(req *http.Request, accessToken string) {
 
 // GetDeviceCode initiates the device code OAuth flow
 func (c *Client) GetDeviceCode() (*DeviceCodeResponse, error) {
+	clientID, _ := c.credentials()
 	payload := map[string]string{
-		"client_id": c.clientID,
+		"client_id": clientID,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -284,10 +351,11 @@ func (c *Client) GetDeviceCode() (*DeviceCodeResponse, error) {
 // PollForToken polls for the OAuth token after user has authorized
 // Returns nil, nil if still pending authorization
 func (c *Client) PollForToken(deviceCode string) (*TokenResponse, error) {
+	clientID, clientSecret := c.credentials()
 	payload := map[string]string{
 		"code":          deviceCode,
-		"client_id":     c.clientID,
-		"client_secret": c.clientSecret,
+		"client_id":     clientID,
+		"client_secret": clientSecret,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -331,10 +399,11 @@ func (c *Client) PollForToken(deviceCode string) (*TokenResponse, error) {
 
 // RefreshAccessToken refreshes an expired access token
 func (c *Client) RefreshAccessToken(refreshToken string) (*TokenResponse, error) {
+	clientID, clientSecret := c.credentials()
 	payload := map[string]string{
 		"refresh_token": refreshToken,
-		"client_id":     c.clientID,
-		"client_secret": c.clientSecret,
+		"client_id":     clientID,
+		"client_secret": clientSecret,
 		"redirect_uri":  "urn:ietf:wg:oauth:2.0:oob",
 		"grant_type":    "refresh_token",
 	}
@@ -400,9 +469,14 @@ func (c *Client) GetUserProfile(accessToken string) (*UserProfile, error) {
 // GetWatchlist retrieves the user's watchlist with pagination
 // Returns items, total item count, and error
 func (c *Client) GetWatchlist(accessToken string, page, limit int) ([]WatchlistItem, int, error) {
+	return c.GetWatchlistCtx(context.Background(), accessToken, page, limit)
+}
+
+// GetWatchlistCtx is GetWatchlist bound to ctx; cancelling ctx aborts the request.
+func (c *Client) GetWatchlistCtx(ctx context.Context, accessToken string, page, limit int) ([]WatchlistItem, int, error) {
 	url := fmt.Sprintf("%s/users/me/watchlist?page=%d&limit=%d", traktAPIBaseURL, page, limit)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
@@ -436,12 +510,20 @@ func (c *Client) GetWatchlist(accessToken string, page, limit int) ([]WatchlistI
 
 // GetAllWatchlist retrieves the complete watchlist (all pages)
 func (c *Client) GetAllWatchlist(accessToken string) ([]WatchlistItem, error) {
+	return c.GetAllWatchlistCtx(context.Background(), accessToken)
+}
+
+// GetAllWatchlistCtx retrieves all watchlist pages, stopping when ctx is cancelled.
+func (c *Client) GetAllWatchlistCtx(ctx context.Context, accessToken string) ([]WatchlistItem, error) {
 	var allItems []WatchlistItem
 	page := 1
 	limit := 100 // Max items per page
 
 	for {
-		items, totalCount, err := c.GetWatchlist(accessToken, page, limit)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		items, totalCount, err := c.GetWatchlistCtx(ctx, accessToken, page, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -569,11 +651,18 @@ func NormalizeMediaType(traktType string) string {
 
 // HasCredentials checks if the client has valid credentials configured
 func (c *Client) HasCredentials() bool {
-	return c.clientID != "" && c.clientSecret != ""
+	clientID, clientSecret := c.credentials()
+	return clientID != "" && clientSecret != ""
 }
 
-// UpdateCredentials updates the client credentials
+// UpdateCredentials updates the client credentials in place.
+//
+// This is memory-safe, but it mutates state seen by every user of this
+// client. Never call it on a client shared across concurrent requests or
+// accounts; use WithCredentials/ForAccount to get a per-account client.
 func (c *Client) UpdateCredentials(clientID, clientSecret string) {
+	c.credMu.Lock()
+	defer c.credMu.Unlock()
 	c.clientID = clientID
 	c.clientSecret = clientSecret
 }
@@ -1037,6 +1126,11 @@ func (c *Client) GetUserSmartLists(accessToken string) ([]SmartList, error) {
 
 // GetSmartListItems retrieves one page of items resolved by a Smart List.
 func (c *Client) GetSmartListItems(accessToken, slug, mediaType string, page, limit int) ([]ListItem, int, error) {
+	return c.GetSmartListItemsCtx(context.Background(), accessToken, slug, mediaType, page, limit)
+}
+
+// GetSmartListItemsCtx is GetSmartListItems bound to ctx.
+func (c *Client) GetSmartListItemsCtx(ctx context.Context, accessToken, slug, mediaType string, page, limit int) ([]ListItem, int, error) {
 	itemType := strings.TrimSpace(mediaType)
 	if itemType == "" || itemType == "media" {
 		itemType = "media"
@@ -1051,7 +1145,7 @@ func (c *Client) GetSmartListItems(accessToken, slug, mediaType string, page, li
 		limit,
 	)
 
-	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
@@ -1080,9 +1174,14 @@ func (c *Client) GetSmartListItems(accessToken, slug, mediaType string, page, li
 
 // GetListItems retrieves items from a specific user list
 func (c *Client) GetListItems(accessToken string, listID string, page, limit int) ([]ListItem, int, error) {
+	return c.GetListItemsCtx(context.Background(), accessToken, listID, page, limit)
+}
+
+// GetListItemsCtx is GetListItems bound to ctx.
+func (c *Client) GetListItemsCtx(ctx context.Context, accessToken string, listID string, page, limit int) ([]ListItem, int, error) {
 	url := fmt.Sprintf("%s/users/me/lists/%s/items?page=%d&limit=%d", traktAPIBaseURL, listID, page, limit)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
@@ -1115,19 +1214,27 @@ func (c *Client) GetListItems(accessToken string, listID string, page, limit int
 
 // GetAllListItems retrieves all items from a specific user list
 func (c *Client) GetAllListItems(accessToken string, listID string) ([]ListItem, error) {
+	return c.GetAllListItemsCtx(context.Background(), accessToken, listID)
+}
+
+// GetAllListItemsCtx retrieves all list pages, stopping when ctx is cancelled.
+func (c *Client) GetAllListItemsCtx(ctx context.Context, accessToken string, listID string) ([]ListItem, error) {
 	var allItems []ListItem
 	page := 1
 	limit := 100
 	mediaType, smartListSlug, isSmartList := decodeSmartListID(listID)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var items []ListItem
 		var totalCount int
 		var err error
 		if isSmartList {
-			items, totalCount, err = c.GetSmartListItems(accessToken, smartListSlug, mediaType, page, limit)
+			items, totalCount, err = c.GetSmartListItemsCtx(ctx, accessToken, smartListSlug, mediaType, page, limit)
 		} else {
-			items, totalCount, err = c.GetListItems(accessToken, listID, page, limit)
+			items, totalCount, err = c.GetListItemsCtx(ctx, accessToken, listID, page, limit)
 		}
 		if err != nil {
 			return nil, err
