@@ -25,6 +25,9 @@ import (
 	"novastream/internal/requestsecurity"
 
 	"golang.org/x/image/draw"
+	// TMDB can serve WebP bytes from .jpg URLs; register the decoder so the
+	// proxy can transcode them instead of failing with a 500.
+	_ "golang.org/x/image/webp"
 )
 
 const (

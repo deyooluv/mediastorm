@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"os"
 	"testing"
 )
 
@@ -106,5 +107,35 @@ func TestPrepareProxyImageDownscalesAtRequestedQuality(t *testing.T) {
 	}
 	if format != "jpeg" || config.Width != 4 || config.Height != 6 {
 		t.Fatalf("resized image = %s %dx%d, want jpeg 4x6", format, config.Width, config.Height)
+	}
+}
+
+func TestPrepareProxyImageTranscodesWebPToJPEG(t *testing.T) {
+	// TMDB serves some ".jpg" artwork as WebP; the proxy must still decode it.
+	source, err := os.ReadFile("testdata/proxy-source.lossy.webp")
+	if err != nil {
+		t.Fatalf("read webp fixture: %v", err)
+	}
+	sourceConfig, _, err := image.DecodeConfig(bytes.NewReader(source))
+	if err != nil {
+		t.Fatalf("decode webp fixture config: %v", err)
+	}
+
+	for _, targetWidth := range []int{0, sourceConfig.Width / 2} {
+		got, err := prepareProxyImage(source, targetWidth, 90)
+		if err != nil {
+			t.Fatalf("prepareProxyImage(width=%d): %v", targetWidth, err)
+		}
+		config, format, err := image.DecodeConfig(bytes.NewReader(got))
+		if err != nil {
+			t.Fatalf("decode proxied image (width=%d): %v", targetWidth, err)
+		}
+		wantWidth := sourceConfig.Width
+		if targetWidth > 0 {
+			wantWidth = targetWidth
+		}
+		if format != "jpeg" || config.Width != wantWidth {
+			t.Fatalf("proxied image = %s width %d, want jpeg width %d", format, config.Width, wantWidth)
+		}
 	}
 }
