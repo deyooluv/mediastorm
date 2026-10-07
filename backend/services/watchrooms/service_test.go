@@ -90,7 +90,7 @@ func (r *fakeRoomRepo) SetExternalGuestReady(_ context.Context, _, guestID strin
 	return nil
 }
 func (r *fakeRoomRepo) BindExternalSource(_ context.Context, roomID, creatorProfileID, resource string, params map[string]string, now time.Time) (bool, error) {
-	if r.room == nil || r.room.ID != roomID || r.room.CreatorProfileID != creatorProfileID || r.externalInvite == nil || !r.externalInvite.Active {
+	if r.room == nil || r.room.ID != roomID || r.room.CreatorProfileID != creatorProfileID || r.room.Status == models.WatchRoomStatusEnded {
 		return false, nil
 	}
 	if r.externalSource != nil {
@@ -434,6 +434,55 @@ func TestExternalInvitationCoexistsWithLocalProfileInvite(t *testing.T) {
 	}
 	if _, err := svc.ResolveExternalInvitation(context.Background(), invite.Token, false); !errors.Is(err, ErrInviteUnavailable) {
 		t.Fatalf("resolved revoked invitation with err %v", err)
+	}
+}
+
+func TestBindExternalSourceDoesNotRequireShareLink(t *testing.T) {
+	repo := &fakeRoomRepo{}
+	svc := New(repo, fakeProfiles{
+		"host":  {ID: "host", AccountID: "home", Name: "Host", AllowShareLinks: true},
+		"local": {ID: "local", AccountID: "home", Name: "Local", AllowShareLinks: true},
+	}, fakeAccounts{})
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	room, err := svc.Create(ctx, "home", "host", models.WatchRoomCreate{
+		Title: "Movie", MediaType: "movie", ItemID: "tmdb:movie:1", InviteeProfileIDs: []string{"local"}, Capabilities: supportedCapabilities,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	// A household-only room has no share link; the host's bind must still
+	// succeed (and stay idempotent) rather than reporting a conflict.
+	for i := 0; i < 2; i++ {
+		source, err := svc.BindExternalSource(ctx, "home", "host", room.ID, "/movies/movie.mkv", nil)
+		if err != nil || source == nil || source.Resource != "/movies/movie.mkv" {
+			t.Fatalf("BindExternalSource() attempt %d = %#v, %v", i+1, source, err)
+		}
+	}
+	if _, err := svc.BindExternalSource(ctx, "home", "local", room.ID, "/movies/movie.mkv", nil); !errors.Is(err, ErrNotCreator) {
+		t.Fatalf("invitee bind err = %v, want %v", err, ErrNotCreator)
+	}
+
+	// A share link created after playback started can be served immediately.
+	invite, err := svc.CreateExternalInvitation(ctx, "home", "host", room.ID)
+	if err != nil {
+		t.Fatalf("CreateExternalInvitation() error = %v", err)
+	}
+	if _, err := svc.JoinExternalGuest(ctx, invite, "browser-1", "Outside Guest", "browser", models.WatchRoomClientCapabilities{StateSync: true, ProtocolVersion: 1}); err != nil {
+		t.Fatalf("JoinExternalGuest() error = %v", err)
+	}
+	source, err := svc.ExternalSourceForGuest(ctx, room.ID, "browser-1")
+	if err != nil || source.Resource != "/movies/movie.mkv" {
+		t.Fatalf("ExternalSourceForGuest() = %#v, %v", source, err)
+	}
+
+	if err := svc.End(ctx, room.ID, "host"); err != nil {
+		t.Fatalf("End() error = %v", err)
+	}
+	if _, err := svc.BindExternalSource(ctx, "home", "host", room.ID, "/movies/movie.mkv", nil); !errors.Is(err, ErrRoomEnded) {
+		t.Fatalf("ended room bind err = %v, want %v", err, ErrRoomEnded)
 	}
 }
 

@@ -408,6 +408,19 @@ func (s *Service) BindExternalSource(ctx context.Context, actorAccountID, creato
 	if resource == "" {
 		return nil, ErrInvalidMedia
 	}
+	room, err := s.Get(ctx, roomID, creatorProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if room.CreatorProfileID != creatorProfileID {
+		return nil, ErrNotCreator
+	}
+	if room.Status == models.WatchRoomStatusEnded {
+		return nil, ErrRoomEnded
+	}
+	// The source is bound whether or not a share link exists yet: it is only
+	// ever handed to external guests, who must join through an active invite,
+	// and binding up front lets a link created mid-playback start immediately.
 	bound, err := s.repo.BindExternalSource(ctx, roomID, creatorProfileID, resource, params, s.now().UTC())
 	if err != nil {
 		return nil, err

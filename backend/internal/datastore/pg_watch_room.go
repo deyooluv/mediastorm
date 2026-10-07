@@ -417,8 +417,7 @@ func (r *pgWatchRoomRepo) BindExternalSource(ctx context.Context, roomID, creato
 	}
 	tag, err := r.pool.Exec(ctx, `INSERT INTO watch_room_external_sources (room_id,resource,params,bound_at)
 		SELECT r.id,$3,$4,$5 FROM watch_rooms r
-		JOIN watch_room_external_invites i ON i.room_id=r.id
-		WHERE r.id=$1 AND r.creator_profile_id=$2 AND r.status<>'ended' AND i.active AND i.expires_at>$5
+		WHERE r.id=$1 AND r.creator_profile_id=$2 AND r.status<>'ended'
 		ON CONFLICT (room_id) DO NOTHING`, roomID, creatorProfileID, resource, paramsJSON, now)
 	if err != nil {
 		return false, err
