@@ -3450,9 +3450,13 @@ func (s *Service) cachedTVDBSeriesID(req models.SeriesDetailsQuery) int64 {
 	return 0
 }
 
-// tryFallbackSeriesTVDBID is called when a TVDB series fetch returns 404 (stub entry).
-// It searches by name without the year constraint to find a parent series
-// (e.g. "Company Retreat" → "Jury Duty" S2). Returns 0 if no fallback found.
+// tryFallbackSeriesTVDBID is called when a TVDB series fetch returns 404 (stub
+// or deleted entry). It re-resolves through TVDB search, bypassing the
+// TMDB-derived mapping: TMDB's external_ids can keep pointing at a TVDB record
+// that was deleted or merged (e.g. TMDB 296286 → dead TVDB 465973), so reusing
+// it would just return the same dead ID. Search drops the year constraint so it
+// can also find a parent series (e.g. "Company Retreat" → "Jury Duty" S2).
+// Returns 0 if no fallback found.
 func (s *Service) tryFallbackSeriesTVDBID(ctx context.Context, req models.SeriesDetailsQuery, failedID int64) int64 {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
@@ -3460,7 +3464,7 @@ func (s *Service) tryFallbackSeriesTVDBID(ctx context.Context, req models.Series
 	}
 
 	// Check if we've already resolved this failed ID
-	fallbackKey := cacheKey("tvdb", "series-fallback", strconv.FormatInt(failedID, 10))
+	fallbackKey := cacheKey("tvdb", "series-fallback", "v2", strconv.FormatInt(failedID, 10))
 	var cachedFallback int64
 	if ok, _ := s.cache.get(fallbackKey, &cachedFallback); ok {
 		if cachedFallback > 0 {
@@ -3473,10 +3477,27 @@ func (s *Service) tryFallbackSeriesTVDBID(ctx context.Context, req models.Series
 	fallbackReq := req
 	fallbackReq.TVDBID = 0
 	fallbackReq.Year = 0
-	altID, altErr := s.resolveSeriesTVDBIDActual(ctx, fallbackReq)
+	if strings.TrimSpace(fallbackReq.IMDBID) == "" && fallbackReq.TMDBID > 0 && s.tmdb != nil && s.tmdb.isConfigured() {
+		// An IMDB remote-id search is the most precise way to find the live
+		// TVDB record, so borrow the IMDB ID from TMDB when the caller lacks it.
+		if title, err := s.tmdb.seriesDetails(ctx, fallbackReq.TMDBID); err == nil && title != nil {
+			fallbackReq.IMDBID = strings.TrimSpace(title.IMDBID)
+		}
+	}
+	altID, exactMatch, altErr := s.searchSeriesTVDBID(fallbackReq, failedID)
 	if altErr == nil && altID > 0 && altID != failedID {
 		log.Printf("[metadata] tvdb 404 fallback: resolved %q to tvdbId=%d (was %d)", name, altID, failedID)
 		_ = s.cache.set(fallbackKey, altID)
+		if exactMatch && req.TMDBID > 0 {
+			// Repoint the TMDB→TVDB mapping so later lookups skip the dead ID.
+			// Only remote-id matches qualify; a loose name match must not
+			// overwrite the authoritative mapping.
+			resolveKey := seriesTVDBResolutionCacheKey(req.TMDBID)
+			var cachedID int64
+			if ok, _ := s.cache.get(resolveKey, &cachedID); !ok || cachedID == failedID {
+				_ = s.cache.set(resolveKey, altID)
+			}
+		}
 		return altID
 	}
 
@@ -3523,26 +3544,36 @@ func (s *Service) resolveSeriesTVDBIDActual(ctx context.Context, req models.Seri
 			}
 		}
 	}
+	id, _, err := s.searchSeriesTVDBID(req, 0)
+	return id, err
+}
+
+// searchSeriesTVDBID resolves a series TVDB ID via TVDB search, preferring
+// exact TMDB/IMDB remote-id matches over language-ranked name matches.
+// excludeID (when > 0) is skipped, e.g. a TVDB ID that just returned 404.
+func (s *Service) searchSeriesTVDBID(req models.SeriesDetailsQuery, excludeID int64) (id int64, exactMatch bool, err error) {
+	name := strings.TrimSpace(req.Name)
 	if !s.client.isConfigured() {
-		return 0, fmt.Errorf("tvdb api key not configured")
+		return 0, false, fmt.Errorf("tvdb api key not configured")
 	}
 	if name == "" {
-		return 0, fmt.Errorf("series name required to resolve tvdb id")
+		return 0, false, fmt.Errorf("series name required to resolve tvdb id")
 	}
 
 	var results []tvdbSearchResult
-	var err error
 	if imdbID := strings.TrimSpace(req.IMDBID); imdbID != "" {
 		results, err = s.searchTVDBSeries(name, 0, imdbID)
 		if err != nil {
 			log.Printf("[metadata] tvdb imdb series search failed imdbId=%s name=%q err=%v", imdbID, name, err)
 		}
+		results = excludeTVDBSearchResult(results, excludeID)
 	}
 	if len(results) == 0 {
 		results, err = s.searchTVDBSeries(name, req.Year, "")
+		results = excludeTVDBSearchResult(results, excludeID)
 	}
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// If we have a TMDB ID, try to match it exactly first
@@ -3564,7 +3595,7 @@ func (s *Service) resolveSeriesTVDBIDActual(ctx context.Context, req models.Seri
 							// Cache the TMDB→TVDB ID mapping
 							cacheID := seriesTVDBResolutionCacheKey(req.TMDBID)
 							_ = s.cache.set(cacheID, id)
-							return id, nil
+							return id, true, nil
 						}
 					}
 				}
@@ -3585,7 +3616,7 @@ func (s *Service) resolveSeriesTVDBIDActual(ctx context.Context, req models.Seri
 						id, err := strconv.ParseInt(strings.TrimSpace(result.TVDBID), 10, 64)
 						if err == nil {
 							log.Printf("[metadata] resolved tvdb id %d via imdb match imdbId=%s for series %q", id, imdbID, name)
-							return id, nil
+							return id, true, nil
 						}
 					}
 				}
@@ -3637,11 +3668,25 @@ func (s *Service) resolveSeriesTVDBIDActual(ctx context.Context, req models.Seri
 			}
 			log.Printf("[metadata] resolved tvdb id %d with language=%q for series %q", id, result.PrimaryLanguage, name)
 
-			return id, nil
+			return id, false, nil
 		}
 	}
 
-	return 0, fmt.Errorf("no tvdb match found for %q", name)
+	return 0, false, fmt.Errorf("no tvdb match found for %q", name)
+}
+
+func excludeTVDBSearchResult(results []tvdbSearchResult, excludeID int64) []tvdbSearchResult {
+	if excludeID <= 0 || len(results) == 0 {
+		return results
+	}
+	excluded := strconv.FormatInt(excludeID, 10)
+	filtered := make([]tvdbSearchResult, 0, len(results))
+	for _, result := range results {
+		if strings.TrimSpace(result.TVDBID) != excluded {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
 }
 
 func seriesTVDBResolutionCacheKey(tmdbID int64) string {
