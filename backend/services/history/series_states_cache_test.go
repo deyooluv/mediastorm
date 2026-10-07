@@ -490,6 +490,83 @@ func TestListSeriesStatesSkipsCachingWhenRevisionChangesDuringBuild(t *testing.T
 	}
 }
 
+func TestListSeriesStatesConcurrentMissesShareOneBuild(t *testing.T) {
+	svc, _ := newSeriesStatesCacheService(t)
+	mustWatch(t, svc, 1, true)
+
+	// Only the first lookup blocks; any separate build would pass straight
+	// through (unlike sync.Once, which would make later callers wait too).
+	blocking := &firstLookupBlockingMetadataService{
+		countingMetadataService: &countingMetadataService{mockMetadataService: &mockMetadataService{seriesDetails: cacheTestSeriesDetails()}},
+		entered:                 make(chan struct{}),
+		release:                 make(chan struct{}),
+	}
+	svc.SetMetadataService(blocking)
+
+	const callers = 4
+	results := make(chan []models.SeriesWatchState, callers)
+	go func() {
+		states, _ := svc.ListSeriesStates(cacheTestUser)
+		results <- states
+	}()
+	select {
+	case <-blocking.entered:
+	case <-time.After(10 * time.Second):
+		close(blocking.release)
+		t.Fatal("build never reached the metadata lookup")
+	}
+	for i := 1; i < callers; i++ {
+		go func() {
+			states, _ := svc.ListSeriesStates(cacheTestUser)
+			results <- states
+		}()
+	}
+
+	// Joiners must wait on the in-flight build rather than run their own.
+	select {
+	case <-results:
+		close(blocking.release)
+		t.Fatal("a concurrent caller finished while the shared build was still blocked")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(blocking.release)
+
+	var all [][]models.SeriesWatchState
+	for i := 0; i < callers; i++ {
+		select {
+		case states := <-results:
+			if len(states) != 1 {
+				t.Fatalf("caller got %d series states, want 1", len(states))
+			}
+			all = append(all, states)
+		case <-time.After(10 * time.Second):
+			t.Fatal("callers did not finish after the build was released")
+		}
+	}
+	// Each caller owns its result.
+	all[0][0].SeriesTitle = "mutated"
+	for i := 1; i < len(all); i++ {
+		if all[i][0].SeriesTitle == "mutated" {
+			t.Fatalf("caller %d shares backing storage with caller 0", i)
+		}
+	}
+}
+
+type firstLookupBlockingMetadataService struct {
+	*countingMetadataService
+	lookups atomic.Int64
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *firstLookupBlockingMetadataService) SeriesDetailsLite(ctx context.Context, query models.SeriesDetailsQuery) (*models.SeriesDetails, error) {
+	if m.lookups.Add(1) == 1 {
+		close(m.entered)
+		<-m.release
+	}
+	return m.countingMetadataService.SeriesDetailsLite(ctx, query)
+}
+
 type blockingMetadataService struct {
 	*countingMetadataService
 	once    sync.Once

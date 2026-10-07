@@ -21,6 +21,8 @@ import (
 	"novastream/internal/mediaidentity"
 	"novastream/models"
 	"novastream/services/calendar"
+
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -182,6 +184,7 @@ type Service struct {
 	userWatchStateRev    map[string]uint64
 	globalWatchStateRev  uint64
 	seriesStatesCache    map[string]*cachedSeriesStates // userID -> all series states
+	seriesStatesBuilds   singleflight.Group             // one in-flight rebuild per user+revision
 	changeMu             sync.RWMutex
 	watchStateChanged    func(userID string)
 	playbackProgressGate chan struct{}
@@ -1035,29 +1038,36 @@ func (s *Service) ListSeriesStates(userID string) ([]models.SeriesWatchState, er
 		return cloneSeriesWatchStates(cached.items), nil
 	}
 
-	ctx := context.Background()
-	items, err := s.buildSeriesStatesFromHistory(ctx, userID, false)
+	buildKey := fmt.Sprintf("%s\x00%d:%d:%d", userID, revision.user, revision.global, revision.airtime)
+	built, err, _ := s.seriesStatesBuilds.Do(buildKey, func() (any, error) {
+		items, err := s.buildSeriesStatesFromHistory(context.Background(), userID, false)
+		if err != nil {
+			return nil, err
+		}
+
+		s.mu.Lock()
+		// Only cache when nothing changed while building: a concurrent mutation
+		// (or an identity repair performed by the build itself) means the result may
+		// reflect pre-mutation inputs.
+		if s.watchStateRevisionLocked(userID) == revision && s.metadataService != nil {
+			if s.seriesStatesCache == nil {
+				s.seriesStatesCache = make(map[string]*cachedSeriesStates)
+			}
+			s.seriesStatesCache[userID] = &cachedSeriesStates{
+				revision:  revision,
+				items:     cloneSeriesWatchStates(items),
+				expiresAt: s.seriesStatesExpiryLocked(userID, time.Now()),
+			}
+		}
+		s.mu.Unlock()
+		return items, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	s.mu.Lock()
-	// Only cache when nothing changed while building: a concurrent mutation
-	// (or an identity repair performed by the build itself) means the result may
-	// reflect pre-mutation inputs.
-	if s.watchStateRevisionLocked(userID) == revision && s.metadataService != nil {
-		if s.seriesStatesCache == nil {
-			s.seriesStatesCache = make(map[string]*cachedSeriesStates)
-		}
-		s.seriesStatesCache[userID] = &cachedSeriesStates{
-			revision:  revision,
-			items:     cloneSeriesWatchStates(items),
-			expiresAt: s.seriesStatesExpiryLocked(userID, time.Now()),
-		}
-	}
-	s.mu.Unlock()
-
-	return items, nil
+	// The build result is shared by every caller that joined it.
+	items, _ := built.([]models.SeriesWatchState)
+	return cloneSeriesWatchStates(items), nil
 }
 
 // seriesStatesExpiryLocked returns when a series state cache entry built now
