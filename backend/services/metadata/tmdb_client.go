@@ -47,7 +47,19 @@ const (
 	tmdbBackdropAnalysisSize  = "w300"
 	maxTMDBBackdropCandidates = 10
 	maxTMDBAlternateBackdrops = 5
+
+	// Backdrop analysis downloads run concurrently and share one budget; any
+	// signature still missing when it expires falls back to vote-only ranking.
+	tmdbBackdropSignatureConcurrency = 6
+
+	// Concurrent per-season requests for one series; the shared request
+	// limiter still spaces them.
+	tmdbSeasonFetchConcurrency = 6
 )
+
+// tmdbBackdropSignatureBudget bounds all backdrop analysis downloads for one
+// title (a variable so tests can shorten it).
+var tmdbBackdropSignatureBudget = 2500 * time.Millisecond
 
 // TMDB genre ID → name maps (standard IDs that rarely change)
 var tmdbMovieGenres = map[int]string{
@@ -484,18 +496,28 @@ func (c *tmdbClient) fetchImages(ctx context.Context, mediaType string, tmdbID i
 	// Find best logo: prefer user's language, then English, then no-language.
 	// If none exists, use the best available logo rather than leaving the hero
 	// without any artwork. It may be translated, so mark it as a fallback.
+	// Logo selection and brightness both download images, so they run
+	// alongside the backdrop ranking below.
+	var logoWG sync.WaitGroup
+	var logo *models.Image
 	if len(payload.Logos) > 0 {
 		correctKnownLogoLanguages(apiMediaType, tmdbID, payload.Logos)
-		if selectedLogo, ok := c.selectLogoCandidate(ctx, payload.Logos, preferredLang); ok {
-			result.Logo = buildTMDBImage(selectedLogo.FilePath, tmdbLogoSize, "logo")
-			if result.Logo != nil {
-				result.Logo.Width = selectedLogo.Width
-				result.Logo.Height = selectedLogo.Height
-				result.Logo.Language = selectedLogo.ISO6391
-				result.Logo.IsFallbackLanguage = selectedLogo.ISO6391 != preferredLang
-				result.Logo.IsDark = c.isImageDark(ctx, result.Logo.URL)
+		logoWG.Add(1)
+		go func() {
+			defer logoWG.Done()
+			selectedLogo, ok := c.selectLogoCandidate(ctx, payload.Logos, preferredLang)
+			if !ok {
+				return
 			}
-		}
+			logo = buildTMDBImage(selectedLogo.FilePath, tmdbLogoSize, "logo")
+			if logo != nil {
+				logo.Width = selectedLogo.Width
+				logo.Height = selectedLogo.Height
+				logo.Language = selectedLogo.ISO6391
+				logo.IsFallbackLanguage = selectedLogo.ISO6391 != preferredLang
+				logo.IsDark = c.isImageDark(ctx, logo.URL)
+			}
+		}()
 	}
 
 	if len(payload.Backdrops) > 0 {
@@ -589,6 +611,8 @@ func (c *tmdbClient) fetchImages(ctx context.Context, mediaType string, tmdbID i
 		result.Posters = rankAlternatePosters(payload.Posters, result.TextlessPoster, preferredLang)
 	}
 
+	logoWG.Wait()
+	result.Logo = logo
 	return result, nil
 }
 
@@ -845,18 +869,30 @@ func (c *tmdbClient) rankAlternateBackdrops(ctx context.Context, items []tmdbIma
 		candidates = candidates[:maxTMDBBackdropCandidates]
 	}
 
+	images := make([]*models.Image, len(candidates))
+	signatureURLs := make([]string, 0, len(candidates)+1)
+	if primary != nil {
+		signatureURLs = append(signatureURLs, primary.URL)
+		for i, item := range candidates {
+			if images[i] = buildTMDBImage(item.FilePath, tmdbBackdropSize, "backdrop"); images[i] != nil {
+				signatureURLs = append(signatureURLs, images[i].URL)
+			}
+		}
+	}
+	// Details requests block on this ranking, so the downloads run concurrently
+	// under a shared budget instead of one after another.
+	signatures := c.fetchBackdropVisualSignatures(ctx, signatureURLs)
 	var primarySig *backdropVisualSignature
 	if primary != nil {
-		if sig, err := c.fetchBackdropVisualSignature(ctx, primary.URL); err == nil {
-			primarySig = sig
-		} else {
-			log.Printf("[metadata] backdrop visual signature: primary fetch failed: %v", err)
-		}
+		primarySig = signatures[primary.URL]
 	}
 
 	ranked := make([]rankedBackdropCandidate, 0, len(candidates))
-	for _, item := range candidates {
-		img := buildTMDBImage(item.FilePath, tmdbBackdropSize, "backdrop")
+	for i, item := range candidates {
+		img := images[i]
+		if img == nil {
+			img = buildTMDBImage(item.FilePath, tmdbBackdropSize, "backdrop")
+		}
 		if img == nil {
 			continue
 		}
@@ -864,10 +900,8 @@ func (c *tmdbClient) rankAlternateBackdrops(ctx context.Context, items []tmdbIma
 		img.IsTextless = item.ISO6391 == ""
 		score := item.VoteAverage * 0.25
 		if primarySig != nil {
-			if sig, err := c.fetchBackdropVisualSignature(ctx, img.URL); err == nil {
+			if sig := signatures[img.URL]; sig != nil {
 				score += backdropVisualDiversityScore(primarySig, sig)
-			} else {
-				log.Printf("[metadata] backdrop visual signature: candidate fetch failed path=%s err=%v", item.FilePath, err)
 			}
 		}
 		ranked = append(ranked, rankedBackdropCandidate{image: img, score: score})
@@ -886,6 +920,60 @@ func (c *tmdbClient) rankAlternateBackdrops(ctx context.Context, items []tmdbIma
 		result = append(result, *ranked[i].image)
 	}
 	return result
+}
+
+// fetchBackdropVisualSignatures downloads and fingerprints each distinct URL,
+// keyed by URL. Failed or over-budget fetches are simply absent from the map.
+func (c *tmdbClient) fetchBackdropVisualSignatures(ctx context.Context, imageURLs []string) map[string]*backdropVisualSignature {
+	signatures := make(map[string]*backdropVisualSignature, len(imageURLs))
+	if len(imageURLs) == 0 {
+		return signatures
+	}
+	budgetCtx, cancel := context.WithTimeout(ctx, tmdbBackdropSignatureBudget)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		failures int
+		lastErr  error
+	)
+	slots := make(chan struct{}, tmdbBackdropSignatureConcurrency)
+	seen := make(map[string]struct{}, len(imageURLs))
+	for _, imageURL := range imageURLs {
+		if _, ok := seen[imageURL]; ok || imageURL == "" {
+			continue
+		}
+		seen[imageURL] = struct{}{}
+		wg.Add(1)
+		go func(imageURL string) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-budgetCtx.Done():
+				mu.Lock()
+				failures++
+				lastErr = budgetCtx.Err()
+				mu.Unlock()
+				return
+			}
+			sig, err := c.fetchBackdropVisualSignature(budgetCtx, imageURL)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures++
+				lastErr = err
+				return
+			}
+			signatures[imageURL] = sig
+		}(imageURL)
+	}
+	wg.Wait()
+	if failures > 0 {
+		log.Printf("[metadata] backdrop visual signature: %d/%d fetches failed (last error: %v)", failures, len(seen), lastErr)
+	}
+	return signatures
 }
 
 func (c *tmdbClient) fetchBackdropVisualSignature(ctx context.Context, imageURL string) (*backdropVisualSignature, error) {
@@ -1403,31 +1491,64 @@ func (c *tmdbClient) seriesDetails(ctx context.Context, tmdbID int64) (*models.T
 }
 
 func (c *tmdbClient) seriesDetailsWithSeasons(ctx context.Context, tmdbID int64) (*models.SeriesDetails, error) {
-	title, err := c.seriesDetails(ctx, tmdbID)
-	if err != nil {
-		return nil, err
+	// The series record and its season list are separate requests; fetch both
+	// together, then every season concurrently (long-running shows have dozens).
+	var (
+		title        *models.Title
+		titleErr     error
+		summaries    []tmdbSeasonSummary
+		summariesErr error
+		headWG       sync.WaitGroup
+	)
+	headWG.Add(2)
+	go func() {
+		defer headWG.Done()
+		title, titleErr = c.seriesDetails(ctx, tmdbID)
+	}()
+	go func() {
+		defer headWG.Done()
+		summaries, summariesErr = c.seriesSeasonSummaries(ctx, tmdbID)
+	}()
+	headWG.Wait()
+	if titleErr != nil {
+		return nil, titleErr
 	}
 	if title == nil {
 		return nil, errors.New("tmdb returned nil series")
 	}
-
-	summaries, err := c.seriesSeasonSummaries(ctx, tmdbID)
-	if err != nil {
-		return nil, err
+	if summariesErr != nil {
+		return nil, summariesErr
 	}
 
-	seasons := make([]models.SeriesSeason, 0, len(summaries))
-	for _, summary := range summaries {
+	seasonSlots := make([]models.SeriesSeason, len(summaries))
+	fetched := make([]bool, len(summaries))
+	var seasonWG sync.WaitGroup
+	sem := make(chan struct{}, tmdbSeasonFetchConcurrency)
+	for i, summary := range summaries {
 		if summary.Number < 0 {
 			continue
 		}
-		season, err := c.seriesSeasonDetails(ctx, tmdbID, summary)
-		if err != nil {
-			log.Printf("[tmdb] season details failed tv/%d season/%d: %v", tmdbID, summary.Number, err)
-			seasons = append(seasons, summary.toModel(tmdbID))
-			continue
+		fetched[i] = true
+		seasonWG.Add(1)
+		go func(i int, summary tmdbSeasonSummary) {
+			defer seasonWG.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			season, err := c.seriesSeasonDetails(ctx, tmdbID, summary)
+			if err != nil {
+				log.Printf("[tmdb] season details failed tv/%d season/%d: %v", tmdbID, summary.Number, err)
+				season = summary.toModel(tmdbID)
+			}
+			seasonSlots[i] = season
+		}(i, summary)
+	}
+	seasonWG.Wait()
+
+	seasons := make([]models.SeriesSeason, 0, len(summaries))
+	for i := range summaries {
+		if fetched[i] {
+			seasons = append(seasons, seasonSlots[i])
 		}
-		seasons = append(seasons, season)
 	}
 
 	sort.Slice(seasons, func(i, j int) bool {

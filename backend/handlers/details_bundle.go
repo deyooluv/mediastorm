@@ -339,15 +339,32 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 		}
 	}()
 
-	// 2. Similar content — wait for details to resolve the correct TMDB ID,
-	// then fetch similar content. Falls back to the request param if details
-	// didn't resolve a TMDB ID.
+	// 2. Similar content — starts immediately from the request's TMDB ID so it
+	// overlaps the details fetch. Details may resolve a different (correct) TMDB
+	// ID, in which case similar is fetched again for that ID. Without a request
+	// TMDB ID it waits for details to resolve one.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		detailsDone.Wait()
 
+		type similarResult struct {
+			titles []models.Title
+			err    error
+		}
+		var speculative chan similarResult
+		if tmdbID > 0 {
+			speculative = make(chan similarResult, 1)
+			go func() {
+				titles, err := metadataSvc.Similar(r.Context(), contentType, tmdbID)
+				speculative <- similarResult{titles: titles, err: err}
+			}()
+		}
+
+		start := time.Now()
+		detailsDone.Wait()
+		mu.Lock()
 		similarTMDBID := resolvedTMDBID
+		mu.Unlock()
 		if similarTMDBID == 0 {
 			similarTMDBID = tmdbID
 		}
@@ -355,12 +372,17 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 			return
 		}
 
-		if similarTMDBID != tmdbID && tmdbID > 0 {
-			log.Printf("[details-bundle] similar: using resolved TMDB ID %d instead of request param %d", similarTMDBID, tmdbID)
+		var titles []models.Title
+		var err error
+		if speculative != nil && similarTMDBID == tmdbID {
+			result := <-speculative
+			titles, err = result.titles, result.err
+		} else {
+			if tmdbID > 0 {
+				log.Printf("[details-bundle] similar: using resolved TMDB ID %d instead of request param %d", similarTMDBID, tmdbID)
+			}
+			titles, err = metadataSvc.Similar(r.Context(), contentType, similarTMDBID)
 		}
-
-		start := time.Now()
-		titles, err := metadataSvc.Similar(r.Context(), contentType, similarTMDBID)
 		log.Printf("[details-bundle timing] similar: %dms (err=%v)", time.Since(start).Milliseconds(), err)
 		if err != nil {
 			log.Printf("[details-bundle] similar error: %v", err)

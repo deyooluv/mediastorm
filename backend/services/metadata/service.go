@@ -2211,8 +2211,42 @@ func (s *Service) getMovieDetailsFromTMDB(ctx context.Context, req models.MovieD
 		return &cached, nil
 	}
 
+	// Credits, images and releases key off the TMDB ID alone, so they are
+	// fetched alongside the main details call; ratings need its IMDB ID.
+	enrichStart := time.Now()
+	var (
+		enrichWG            sync.WaitGroup
+		releasesWarmWG      sync.WaitGroup
+		credits             *models.Credits
+		creditsErr          error
+		images              *tmdbImagesResult
+		imagesErr           error
+		creditsMs, imagesMs int64
+	)
+	enrichWG.Add(2)
+	go func() {
+		defer enrichWG.Done()
+		start := time.Now()
+		credits, creditsErr = s.cachedFetchCredits(ctx, "movie", req.TMDBID)
+		creditsMs = time.Since(start).Milliseconds()
+	}()
+	go func() {
+		defer enrichWG.Done()
+		start := time.Now()
+		images, imagesErr = s.cachedFetchImages(ctx, "movie", req.TMDBID)
+		imagesMs = time.Since(start).Milliseconds()
+	}()
+	releasesWarmWG.Add(1)
+	go func() {
+		// Populates the releases cache; the real enrichment below reads it.
+		defer releasesWarmWG.Done()
+		scratch := models.Title{MediaType: "movie"}
+		s.enrichMovieReleases(ctx, &scratch, req.TMDBID)
+	}()
+
 	// Fetch from TMDB
 	tmdbMovie, err := s.tmdb.movieDetails(ctx, req.TMDBID)
+	detailsMs := time.Since(enrichStart).Milliseconds()
 	if err != nil {
 		log.Printf("[metadata] TMDB movie fetch failed tmdbId=%d err=%v", req.TMDBID, err)
 		return nil, fmt.Errorf("failed to fetch movie from TMDB: %w", err)
@@ -2243,23 +2277,65 @@ func (s *Service) getMovieDetailsFromTMDB(ctx context.Context, req models.MovieD
 	log.Printf("[metadata] movie from TMDB tmdbId=%d name=%q hasPost=%v hasBackdrop=%v",
 		req.TMDBID, movieTitle.Name, movieTitle.Poster != nil, movieTitle.Backdrop != nil)
 
+	// Ratings run alongside the in-flight credits/images while releases enrich
+	// the title; results are then applied in the original order.
+	var (
+		ratings              []models.Rating
+		ratingsErr           error
+		ratingsMs            int64
+		ratingsFetched       bool
+		ratingsIMDBID        = movieTitle.IMDBID
+		hydrateRatingsNeeded = s.mdblist != nil && s.mdblist.IsEnabled()
+	)
+	if ratingsIMDBID == "" {
+		ratingsIMDBID = req.IMDBID
+	}
+	if hydrateRatingsNeeded && ratingsIMDBID != "" {
+		enrichWG.Add(1)
+		go func() {
+			defer enrichWG.Done()
+			start := time.Now()
+			ratings, ratingsErr = s.getMDBListDisplayRatings(ctx, ratingsIMDBID, "movie", 3*time.Second)
+			ratingsMs = time.Since(start).Milliseconds()
+			ratingsFetched = true
+		}()
+	}
+
+	releasesStart := time.Now()
+	if movieTitle.TMDBID == req.TMDBID {
+		releasesWarmWG.Wait()
+	}
 	if s.enrichMovieReleases(ctx, &movieTitle, movieTitle.TMDBID) && len(movieTitle.Releases) > 0 {
 		metadataTracef("[metadata] movie release windows set via TMDB tmdbId=%d releases=%d", movieTitle.TMDBID, len(movieTitle.Releases))
 	}
+	releasesMs := time.Since(releasesStart).Milliseconds()
+	enrichWG.Wait()
 
-	// Fetch cast credits from TMDB
-	if credits, err := s.cachedFetchCredits(ctx, "movie", req.TMDBID); err == nil && credits != nil && len(credits.Cast) > 0 {
+	if creditsErr == nil && credits != nil && len(credits.Cast) > 0 {
 		movieTitle.Credits = credits
 		metadataTracef("[metadata] fetched %d cast members for movie (TMDB) tmdbId=%d", len(credits.Cast), req.TMDBID)
-	} else if err != nil {
-		log.Printf("[metadata] failed to fetch credits for movie (TMDB) tmdbId=%d: %v", req.TMDBID, err)
+	} else if creditsErr != nil {
+		log.Printf("[metadata] failed to fetch credits for movie (TMDB) tmdbId=%d: %v", req.TMDBID, creditsErr)
 	}
 
 	// TMDB's movie details response only contains poster/backdrop paths. Logos
 	// and clean artwork variants come from its separate images endpoint.
-	s.applyCachedTMDBImages(ctx, &movieTitle, "movie", req.TMDBID)
+	if imagesErr != nil {
+		log.Printf("[metadata] failed to fetch images for movie tmdbId=%d: %v", req.TMDBID, imagesErr)
+	} else if images != nil {
+		applyTMDBImagesToTitle(&movieTitle, images)
+	}
 
-	s.hydrateTMDBRatings(ctx, &movieTitle, req.IMDBID, "movie")
+	if ratingsErr != nil {
+		log.Printf("[metadata] failed to hydrate TMDB ratings mediaType=movie imdbId=%s: %v", ratingsIMDBID, ratingsErr)
+	} else if ratingsFetched {
+		movieTitle.Ratings = ratings
+	}
+
+	if total := time.Since(enrichStart); total > time.Second {
+		log.Printf("[metadata] slow movie enrichment tmdbId=%d total=%dms details=%dms releases=%dms credits=%dms images=%dms ratings=%dms",
+			req.TMDBID, total.Milliseconds(), detailsMs, releasesMs, creditsMs, imagesMs, ratingsMs)
+	}
 
 	// Cache the result
 	_ = s.cache.set(cacheID, movieTitle)
@@ -4019,6 +4095,31 @@ func (s *Service) tmdbSeriesDetailsFallback(ctx context.Context, req models.Seri
 		return &cached, nil
 	}
 
+	// Images, credits and the content rating key off the TMDB ID alone, so
+	// they are fetched alongside the series and its seasons.
+	var (
+		enrichWG            sync.WaitGroup
+		images              *tmdbImagesResult
+		imageErr            error
+		credits             *models.Credits
+		creditsErr          error
+		contentRatingTitle  models.Title
+		contentRatingLoaded bool
+	)
+	enrichWG.Add(3)
+	go func() {
+		defer enrichWG.Done()
+		images, imageErr = s.cachedFetchImages(ctx, "series", req.TMDBID)
+	}()
+	go func() {
+		defer enrichWG.Done()
+		credits, creditsErr = s.cachedFetchCredits(ctx, "series", req.TMDBID)
+	}()
+	go func() {
+		defer enrichWG.Done()
+		contentRatingLoaded = s.enrichTVContentRating(ctx, &contentRatingTitle, req.TMDBID)
+	}()
+
 	details, err := s.tmdb.seriesDetailsWithSeasons(ctx, req.TMDBID)
 	if err != nil {
 		return nil, err
@@ -4039,17 +4140,20 @@ func (s *Service) tmdbSeriesDetailsFallback(ctx context.Context, req models.Seri
 		_ = s.cache.set(seriesTVDBResolutionCacheKey(req.TMDBID), details.Title.TVDBID)
 	}
 	s.backfillSeriesIMDBID(ctx, &details.Title, req)
-	if images, imageErr := s.cachedFetchImages(ctx, "series", req.TMDBID); imageErr == nil && images != nil {
+	enrichWG.Wait()
+	if imageErr == nil && images != nil {
 		applyTMDBImagesToTitle(&details.Title, images)
 	} else if imageErr != nil {
 		log.Printf("[metadata] TMDB series fallback image enrichment failed tmdbId=%d err=%v", req.TMDBID, imageErr)
 	}
-	if credits, creditsErr := s.cachedFetchCredits(ctx, "series", req.TMDBID); creditsErr == nil && credits != nil && len(credits.Cast) > 0 {
+	if creditsErr == nil && credits != nil && len(credits.Cast) > 0 {
 		details.Title.Credits = credits
 	} else if creditsErr != nil {
 		log.Printf("[metadata] TMDB series fallback credits enrichment failed tmdbId=%d err=%v", req.TMDBID, creditsErr)
 	}
-	s.enrichTVContentRating(ctx, &details.Title, req.TMDBID)
+	if contentRatingLoaded && details.Title.Certification == "" {
+		details.Title.Certification = contentRatingTitle.Certification
+	}
 	if details.Seasons == nil {
 		details.Seasons = []models.SeriesSeason{}
 	}
@@ -4088,7 +4192,9 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 		originalTVDBID = parseTVDBIDFromTitleID(req.TitleID)
 	}
 
+	seriesStart := time.Now()
 	tvdbID, err := s.resolveSeriesTVDBID(ctx, req)
+	resolveMs := time.Since(seriesStart).Milliseconds()
 	if err != nil {
 
 		log.Printf("[metadata] series details resolve error titleId=%q name=%q year=%d err=%v",
@@ -4358,7 +4464,22 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 
 	log.Printf("[metadata] series details fetch tvdbId=%d", tvdbID)
 
+	// The extended payload (episodes, seasons, artworks) only needs the TVDB ID,
+	// so fetch it alongside the base record. It is discarded if the base fetch
+	// falls back to a parent series ID below.
+	type seriesExtendedResult struct {
+		data tvdbSeriesExtendedData
+		err  error
+	}
+	speculativeTVDBID := tvdbID
+	speculativeExtended := make(chan seriesExtendedResult, 1)
+	go func() {
+		data, err := s.cachedSeriesExtended(speculativeTVDBID, []string{"episodes", "seasons", "artworks"})
+		speculativeExtended <- seriesExtendedResult{data: data, err: err}
+	}()
+
 	base, err := s.getTVDBSeriesDetails(tvdbID)
+	baseMs := time.Since(seriesStart).Milliseconds()
 	if err != nil {
 		log.Printf("[metadata] series details tvdb fetch error tvdbId=%d err=%v", tvdbID, err)
 
@@ -4375,7 +4496,14 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 		}
 	}
 
-	extended, err := s.cachedSeriesExtended(tvdbID, []string{"episodes", "seasons", "artworks"})
+	var extended tvdbSeriesExtendedData
+	if tvdbID == speculativeTVDBID {
+		result := <-speculativeExtended
+		extended, err = result.data, result.err
+	} else {
+		extended, err = s.cachedSeriesExtended(tvdbID, []string{"episodes", "seasons", "artworks"})
+	}
+	extendedMs := time.Since(seriesStart).Milliseconds()
 	if err != nil {
 
 		log.Printf("[metadata] series details extended fetch error tvdbId=%d err=%v", tvdbID, err)
@@ -4467,7 +4595,9 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 	translatedOverview := extended.Overview
 
 	// Wait for translation result
-	if tr := <-translationChan; tr.name != "" || tr.overview != "" {
+	tr := <-translationChan
+	translationMs := time.Since(seriesStart).Milliseconds()
+	if tr.name != "" || tr.overview != "" {
 		if tr.name != "" {
 			translatedName = tr.name
 			log.Printf("[metadata] using translated series name tvdbId=%d lang=%s name=%q", tvdbID, s.client.language, tr.name)
@@ -4584,6 +4714,7 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 
 	// Get season translations from parallel fetch
 	seasonTranslations := <-seasonTransChan
+	seasonTranslationMs := time.Since(seriesStart).Milliseconds()
 	log.Printf("[metadata] received season translations tvdbId=%d count=%d", tvdbID, len(seasonTranslations))
 
 	for _, season := range extended.Seasons {
@@ -4631,6 +4762,7 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 
 	// Get localized episodes from parallel fetch
 	englishEpisodes := <-localizedEpsChan
+	localizedEpisodesMs := time.Since(seriesStart).Milliseconds()
 	log.Printf("[metadata] received localized episodes tvdbId=%d count=%d", tvdbID, len(englishEpisodes))
 
 	// For the default ordering, extended.Episodes already carries the correct
@@ -4755,41 +4887,105 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 	}
 	s.backfillSeriesIMDBID(ctx, &seriesTitle, req)
 	details.Title = seriesTitle
+
+	// Episode metadata, ratings, credits, images, genres and content rating are
+	// independent upstream calls: fetch them together, then apply the results
+	// in their original order. Only the episode enrichment touches details
+	// until the wait below.
+	tailStart := time.Now()
+	tmdbEnrichment := tmdbIDForEnrichment > 0 && s.tmdb != nil && s.tmdb.isConfigured()
+	ratingsIMDBID := seriesTitle.IMDBID
+	var (
+		tailWG                              sync.WaitGroup
+		episodesChanged, episodesComplete   bool
+		seriesRatings                       []models.Rating
+		seriesRatingsErr                    error
+		seriesCredits                       *models.Credits
+		seriesCreditsErr                    error
+		seriesImages                        *tmdbImagesResult
+		seriesImagesErr                     error
+		seriesGenres                        []string
+		seriesGenresErr                     error
+		contentRatingTitle                  = models.Title{Certification: seriesTitle.Certification}
+		contentRatingChanged                bool
+		episodesMs, ratingsMs, creditsMs    int64
+		imagesMs, genresMs, contentRatingMs int64
+	)
+	timed := func(elapsed *int64, fn func()) {
+		tailWG.Add(1)
+		go func() {
+			defer tailWG.Done()
+			start := time.Now()
+			fn()
+			*elapsed = time.Since(start).Milliseconds()
+		}()
+	}
 	if tmdbIDForEnrichment > 0 {
-		if changed, complete := s.enrichTMDBEpisodeMetadata(ctx, &details, tmdbIDForEnrichment); changed {
+		timed(&episodesMs, func() {
+			episodesChanged, episodesComplete = s.enrichTMDBEpisodeMetadata(ctx, &details, tmdbIDForEnrichment)
+		})
+	}
+	// Fetch ratings from MDBList if enabled and IMDB ID is available.
+	// Prefer the disk-persisted ratings cache; only fall back to the API when needed.
+	if ratingsIMDBID != "" && s.mdblist != nil && s.mdblist.IsEnabled() {
+		timed(&ratingsMs, func() {
+			seriesRatings, seriesRatingsErr = s.getMDBListDisplayRatings(ctx, ratingsIMDBID, "show", 3*time.Second)
+		})
+	}
+	if tmdbEnrichment {
+		timed(&creditsMs, func() {
+			seriesCredits, seriesCreditsErr = s.cachedFetchCredits(ctx, "series", tmdbIDForEnrichment)
+		})
+		timed(&imagesMs, func() {
+			seriesImages, seriesImagesErr = s.cachedFetchImages(ctx, "series", tmdbIDForEnrichment)
+		})
+		timed(&genresMs, func() {
+			seriesGenres, seriesGenresErr = s.tmdb.fetchSeriesGenres(ctx, tmdbIDForEnrichment)
+		})
+		timed(&contentRatingMs, func() {
+			contentRatingChanged = s.enrichTVContentRating(ctx, &contentRatingTitle, tmdbIDForEnrichment)
+		})
+	}
+	tailWG.Wait()
+	if total := time.Since(seriesStart); total > time.Second {
+		// Phase marks are cumulative ms since the miss path began; the tail's
+		// concurrent fetches are individual durations.
+		log.Printf("[metadata] slow series details tvdbId=%d tmdbId=%d total=%dms resolve@%d base@%d extended@%d translation@%d seasonTranslations@%d localizedEpisodes@%d tailStart@%d | tail: episodes=%dms ratings=%dms credits=%dms images=%dms genres=%dms contentRating=%dms",
+			tvdbID, tmdbIDForEnrichment, total.Milliseconds(), resolveMs, baseMs, extendedMs, translationMs, seasonTranslationMs, localizedEpisodesMs,
+			tailStart.Sub(seriesStart).Milliseconds(), episodesMs, ratingsMs, creditsMs, imagesMs, genresMs, contentRatingMs)
+	}
+
+	if tmdbIDForEnrichment > 0 {
+		if episodesChanged {
 			log.Printf("[metadata] applied TMDB episode metadata tvdbId=%d tmdbId=%d", tvdbID, tmdbIDForEnrichment)
-			details.EpisodeTMDBEnriched = complete
-		} else if complete {
+			details.EpisodeTMDBEnriched = episodesComplete
+		} else if episodesComplete {
 			details.EpisodeTMDBEnriched = true
 		}
 	}
 
-	// Fetch ratings from MDBList if enabled and IMDB ID is available.
-	// Prefer the disk-persisted ratings cache; only fall back to the API when needed.
-	if seriesTitle.IMDBID != "" && s.mdblist != nil && s.mdblist.IsEnabled() {
-		if ratings, err := s.getMDBListDisplayRatings(ctx, seriesTitle.IMDBID, "show", 3*time.Second); err == nil && len(ratings) > 0 {
-			seriesTitle.Ratings = ratings
-			details.Title = seriesTitle // Update the details with ratings
-			metadataTracef("[metadata] fetched %d ratings for series imdbId=%s", len(ratings), seriesTitle.IMDBID)
-		} else if err != nil {
-			log.Printf("[metadata] failed to fetch ratings for series imdbId=%s: %v", seriesTitle.IMDBID, err)
-		}
+	if seriesRatingsErr == nil && len(seriesRatings) > 0 {
+		seriesTitle.Ratings = seriesRatings
+		details.Title = seriesTitle // Update the details with ratings
+		metadataTracef("[metadata] fetched %d ratings for series imdbId=%s", len(seriesRatings), seriesTitle.IMDBID)
+	} else if seriesRatingsErr != nil {
+		log.Printf("[metadata] failed to fetch ratings for series imdbId=%s: %v", seriesTitle.IMDBID, seriesRatingsErr)
 	}
 
-	// Fetch cast credits from TMDB if configured
-	if tmdbIDForEnrichment > 0 && s.tmdb != nil && s.tmdb.isConfigured() {
-		if credits, err := s.cachedFetchCredits(ctx, "series", tmdbIDForEnrichment); err == nil && credits != nil && len(credits.Cast) > 0 {
-			seriesTitle.Credits = credits
+	// Cast credits from TMDB
+	if tmdbEnrichment {
+		if seriesCreditsErr == nil && seriesCredits != nil && len(seriesCredits.Cast) > 0 {
+			seriesTitle.Credits = seriesCredits
 			details.Title = seriesTitle // Update the details with credits
-			metadataTracef("[metadata] fetched %d cast members for series tmdbId=%d", len(credits.Cast), tmdbIDForEnrichment)
-		} else if err != nil {
-			log.Printf("[metadata] failed to fetch credits for series tmdbId=%d: %v", tmdbIDForEnrichment, err)
+			metadataTracef("[metadata] fetched %d cast members for series tmdbId=%d", len(seriesCredits.Cast), tmdbIDForEnrichment)
+		} else if seriesCreditsErr != nil {
+			log.Printf("[metadata] failed to fetch credits for series tmdbId=%d: %v", tmdbIDForEnrichment, seriesCreditsErr)
 		}
 	}
 
-	// Fetch logo and clean artwork variants from TMDB if configured
-	if tmdbIDForEnrichment > 0 && s.tmdb != nil && s.tmdb.isConfigured() {
-		if images, err := s.cachedFetchImages(ctx, "series", tmdbIDForEnrichment); err == nil && images != nil {
+	// Logo and clean artwork variants from TMDB
+	if tmdbEnrichment {
+		if images := seriesImages; seriesImagesErr == nil && images != nil {
 			if images.Logo != nil {
 				seriesTitle.Logo = images.Logo
 				metadataTracef("[metadata] fetched logo for series tmdbId=%d", seriesTitle.TMDBID)
@@ -4817,33 +5013,32 @@ func (s *Service) SeriesDetails(ctx context.Context, req models.SeriesDetailsQue
 			}
 			seriesTitle.Backdrops = mergeRankedBackdrops(seriesTitle.Backdrops, images.Backdrops, seriesTitle.Backdrop, seriesTitle.TextBackdrop)
 			details.Title = seriesTitle // Update the details with images
-		} else if err != nil {
-			log.Printf("[metadata] failed to fetch images for series tmdbId=%d: %v", seriesTitle.TMDBID, err)
+		} else if seriesImagesErr != nil {
+			log.Printf("[metadata] failed to fetch images for series tmdbId=%d: %v", seriesTitle.TMDBID, seriesImagesErr)
 		}
 	}
 
-	// Fetch genres from TMDB if configured
-	if tmdbIDForEnrichment > 0 && s.tmdb != nil && s.tmdb.isConfigured() {
-		if genres, err := s.tmdb.fetchSeriesGenres(ctx, tmdbIDForEnrichment); err == nil && len(genres) > 0 {
-			seriesTitle.Genres = mergeMetadataGenres(seriesTitle.Genres, genres)
-			log.Printf("[metadata] fetched %d genres for series tmdbId=%d", len(genres), tmdbIDForEnrichment)
+	// Genres from TMDB
+	if tmdbEnrichment {
+		if seriesGenresErr == nil && len(seriesGenres) > 0 {
+			seriesTitle.Genres = mergeMetadataGenres(seriesTitle.Genres, seriesGenres)
+			log.Printf("[metadata] fetched %d genres for series tmdbId=%d", len(seriesGenres), tmdbIDForEnrichment)
 
 			// Also check for genres that commonly use date-based episode naming.
 			if changed, genre := applyDateBasedSeriesClassification(&seriesTitle); changed {
 				log.Printf("[metadata] series release classification updated from TMDB genres tvdbId=%d reason=%q", tvdbID, genre)
 			}
 			details.Title = seriesTitle
-		} else if err != nil {
-			log.Printf("[metadata] failed to fetch genres for series tmdbId=%d: %v", tmdbIDForEnrichment, err)
+		} else if seriesGenresErr != nil {
+			log.Printf("[metadata] failed to fetch genres for series tmdbId=%d: %v", tmdbIDForEnrichment, seriesGenresErr)
 		}
 	}
 
-	// Fetch TV content rating from TMDB if configured
-	if tmdbIDForEnrichment > 0 && s.tmdb != nil && s.tmdb.isConfigured() {
-		if s.enrichTVContentRating(ctx, &seriesTitle, tmdbIDForEnrichment) {
-			log.Printf("[metadata] fetched content rating for series tmdbId=%d rating=%s", tmdbIDForEnrichment, seriesTitle.Certification)
-			details.Title = seriesTitle
-		}
+	// TV content rating from TMDB
+	if tmdbEnrichment && contentRatingChanged {
+		seriesTitle.Certification = contentRatingTitle.Certification
+		log.Printf("[metadata] fetched content rating for series tmdbId=%d rating=%s", tmdbIDForEnrichment, seriesTitle.Certification)
+		details.Title = seriesTitle
 	}
 
 	populateAiredDateTimeUTC(&details)

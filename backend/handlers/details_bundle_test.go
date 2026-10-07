@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"novastream/handlers"
 	"novastream/models"
@@ -33,8 +35,20 @@ type mockMetadataServiceDetailsBundle struct {
 	similarErr       error
 	trailersErr      error
 
-	// Capture the TMDB ID passed to Similar() for verification
-	similarCalledWithTMDBID int64
+	// Optional per-TMDB-ID similar results and artificial latency.
+	similarByTMDBID map[int64][]models.Title
+	movieDelay      time.Duration
+	similarDelay    time.Duration
+
+	// Capture the TMDB IDs passed to Similar() for verification.
+	similarMu    sync.Mutex
+	similarCalls []int64
+}
+
+func (m *mockMetadataServiceDetailsBundle) similarCalledWith() []int64 {
+	m.similarMu.Lock()
+	defer m.similarMu.Unlock()
+	return append([]int64(nil), m.similarCalls...)
 }
 
 func (m *mockMetadataServiceDetailsBundle) SeriesDetails(_ context.Context, _ models.SeriesDetailsQuery) (*models.SeriesDetails, error) {
@@ -44,10 +58,17 @@ func (m *mockMetadataServiceDetailsBundle) SeriesDetailsLite(_ context.Context, 
 	return m.seriesLite, m.seriesLiteErr
 }
 func (m *mockMetadataServiceDetailsBundle) MovieDetails(_ context.Context, _ models.MovieDetailsQuery) (*models.Title, error) {
+	time.Sleep(m.movieDelay)
 	return m.movieDetails, m.movieDetailsErr
 }
 func (m *mockMetadataServiceDetailsBundle) Similar(_ context.Context, _ string, tmdbID int64) ([]models.Title, error) {
-	m.similarCalledWithTMDBID = tmdbID
+	m.similarMu.Lock()
+	m.similarCalls = append(m.similarCalls, tmdbID)
+	m.similarMu.Unlock()
+	time.Sleep(m.similarDelay)
+	if titles, ok := m.similarByTMDBID[tmdbID]; ok {
+		return titles, m.similarErr
+	}
 	return m.similar, m.similarErr
 }
 func (m *mockMetadataServiceDetailsBundle) DiscoverByGenre(_ context.Context, _ string, _ int64, _, _ int) ([]models.TrendingItem, int, error) {
@@ -635,8 +656,9 @@ func TestDetailsBundleHandler_UsesResolvedTMDBID(t *testing.T) {
 		seriesDetails: &models.SeriesDetails{
 			Title: models.Title{Name: "Invader ZIM", ID: "tvdb:series:75545", TMDBID: 3793},
 		},
-		similar: []models.Title{
-			{Name: "Similar Show", ID: "similar1"},
+		similarByTMDBID: map[int64][]models.Title{
+			90:   {{Name: "Wrong Show", ID: "wrong"}},
+			3793: {{Name: "Similar Show", ID: "similar1"}},
 		},
 		trailers: &models.TrailerResponse{},
 	}
@@ -659,8 +681,21 @@ func TestDetailsBundleHandler_UsesResolvedTMDBID(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	if meta.similarCalledWithTMDBID != 3793 {
-		t.Errorf("expected Similar() called with resolved TMDB ID 3793, got %d", meta.similarCalledWithTMDBID)
+	calls := meta.similarCalledWith()
+	calledResolved := false
+	for _, id := range calls {
+		calledResolved = calledResolved || id == 3793
+	}
+	if !calledResolved {
+		t.Errorf("expected Similar() called with resolved TMDB ID 3793, got calls %v", calls)
+	}
+
+	var resp handlers.DetailsBundleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.Similar) != 1 || resp.Similar[0].ID != "similar1" {
+		t.Errorf("expected similar results for resolved TMDB ID 3793, got %+v", resp.Similar)
 	}
 }
 
@@ -694,8 +729,52 @@ func TestDetailsBundleHandler_FallsBackToRequestTMDBID(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	if meta.similarCalledWithTMDBID != 456 {
-		t.Errorf("expected Similar() called with fallback TMDB ID 456, got %d", meta.similarCalledWithTMDBID)
+	if calls := meta.similarCalledWith(); len(calls) != 1 || calls[0] != 456 {
+		t.Errorf("expected one Similar() call with fallback TMDB ID 456, got %v", calls)
+	}
+}
+
+func TestDetailsBundleHandler_SimilarOverlapsDetails(t *testing.T) {
+	// With a request TMDB ID, similar must not wait for details to finish.
+	meta := &mockMetadataServiceDetailsBundle{
+		movieDetails: &models.Title{Name: "Test Movie", ID: "tmdb:movie:789", TMDBID: 789},
+		similar:      []models.Title{{Name: "Similar Movie"}},
+		trailers:     &models.TrailerResponse{},
+		movieDelay:   200 * time.Millisecond,
+		similarDelay: 200 * time.Millisecond,
+	}
+	h := handlers.NewDetailsBundleHandler(
+		meta,
+		&mockHistoryServiceDetailsBundle{},
+		&mockContentPrefsServiceDetailsBundle{},
+		&mockUserServiceDetailsBundle{exists: true},
+	)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/users/user1/details-bundle?type=movie&titleId=tmdb:movie:789&tmdbId=789&name=Test+Movie",
+		nil)
+	req = mux.SetURLVars(req, map[string]string{"userID": "user1"})
+	rec := httptest.NewRecorder()
+
+	started := time.Now()
+	h.GetDetailsBundle(rec, req)
+	elapsed := time.Since(started)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if elapsed >= 380*time.Millisecond {
+		t.Fatalf("bundle took %v; similar should overlap the 200ms details fetch (serial would be ~400ms)", elapsed)
+	}
+	if calls := meta.similarCalledWith(); len(calls) != 1 || calls[0] != 789 {
+		t.Errorf("expected one Similar() call for TMDB ID 789, got %v", calls)
+	}
+	var resp handlers.DetailsBundleResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.Similar) != 1 {
+		t.Errorf("expected 1 similar title, got %d", len(resp.Similar))
 	}
 }
 
