@@ -12,6 +12,8 @@ import (
 
 	"novastream/internal/apiusage"
 	"novastream/models"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // mdblistClient handles requests to the MDBList API for aggregated ratings
@@ -27,9 +29,12 @@ type mdblistClient struct {
 	cacheTTL time.Duration
 
 	// Rate limiting
-	throttleMu  sync.Mutex
-	lastRequest time.Time
+	limiter     priorityLimiter
 	minInterval time.Duration
+
+	// Concurrent lookups for the same title (e.g. a details shell and bundle)
+	// share one API call instead of queueing a second one behind the limiter.
+	inflight singleflight.Group
 }
 
 type mdblistCacheEntry struct {
@@ -150,18 +155,10 @@ func (c *mdblistClient) GetRatings(ctx context.Context, imdbID string, mediaType
 
 	// Retry loop with exponential backoff
 	for attempt := 0; attempt < 3; attempt++ {
-		// Rate limiting — compute wait outside the lock to avoid blocking other goroutines
-		c.throttleMu.Lock()
-		wait := c.minInterval - time.Since(c.lastRequest)
-		if wait > 0 {
-			c.lastRequest = time.Now().Add(wait) // reserve our slot
-		} else {
-			c.lastRequest = time.Now()
-			wait = 0
-		}
-		c.throttleMu.Unlock()
-		if wait > 0 {
-			time.Sleep(wait)
+		// Rate limiting — details-page lookups are granted ahead of queued
+		// background enrichment, and the wait honors the caller's deadline.
+		if err := c.limiter.Wait(ctx, c.minInterval); err != nil {
+			return nil, fmt.Errorf("rate limit wait: %w", err)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -286,6 +283,24 @@ func (c *mdblistClient) GetAllRatings(ctx context.Context, imdbID string, mediaT
 	}
 	c.cacheMu.RUnlock()
 
+	results := c.inflight.DoChan(cacheKey, func() (any, error) {
+		return c.fetchAllRatings(ctx, cacheKey, imdbID, mediaType)
+	})
+	select {
+	case result := <-results:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		ratings, _ := result.Val.([]models.Rating)
+		return ratings, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// fetchAllRatings performs the MDBList API call behind GetAllRatings and
+// caches the result under cacheKey.
+func (c *mdblistClient) fetchAllRatings(ctx context.Context, cacheKey, imdbID, mediaType string) ([]models.Rating, error) {
 	// Fetch all ratings in a single API call
 	url := fmt.Sprintf("https://api.mdblist.com/imdb/%s/%s?apikey=%s", mediaType, imdbID, c.apiKey)
 
@@ -294,18 +309,10 @@ func (c *mdblistClient) GetAllRatings(ctx context.Context, imdbID string, mediaT
 	backoff := 2 * time.Second
 
 	for attempt := 0; attempt < 3; attempt++ {
-		// Rate limiting — compute wait outside the lock to avoid blocking other goroutines
-		c.throttleMu.Lock()
-		wait := c.minInterval - time.Since(c.lastRequest)
-		if wait > 0 {
-			c.lastRequest = time.Now().Add(wait) // reserve our slot
-		} else {
-			c.lastRequest = time.Now()
-			wait = 0
-		}
-		c.throttleMu.Unlock()
-		if wait > 0 {
-			time.Sleep(wait)
+		// Rate limiting — details-page lookups are granted ahead of queued
+		// background enrichment, and the wait honors the caller's deadline.
+		if err := c.limiter.Wait(ctx, c.minInterval); err != nil {
+			return nil, fmt.Errorf("rate limit wait: %w", err)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

@@ -123,11 +123,9 @@ type tmdbClient struct {
 	httpc          *http.Client
 	cache          *fileCache // Optional cache for expensive lookups
 
-	// Rate limiting
-	throttleMu    sync.Mutex
-	lastRequest   time.Time
-	minInterval   time.Duration
-	cooldownUntil time.Time
+	// Rate limiting (shared through requestLimiter across metadata languages)
+	limiter     priorityLimiter
+	minInterval time.Duration
 
 	// In-flight singleflight map for movieDetails — holds only requests
 	// currently being fetched (bounded), not a process-lifetime cache.
@@ -138,35 +136,7 @@ func (c *tmdbClient) waitForRequestSlot(ctx context.Context) error {
 	if c.requestLimiter != nil {
 		return c.requestLimiter.waitForRequestSlot(ctx)
 	}
-	for {
-		now := time.Now()
-		c.throttleMu.Lock()
-		if now.Before(c.cooldownUntil) {
-			wait := time.Until(c.cooldownUntil)
-			c.throttleMu.Unlock()
-			if err := sleepWithContext(ctx, wait); err != nil {
-				return err
-			}
-			continue
-		}
-		availableAt := c.lastRequest.Add(c.minInterval)
-		if availableAt.Before(now) {
-			availableAt = now
-		}
-		c.lastRequest = availableAt
-		c.throttleMu.Unlock()
-
-		if err := sleepWithContext(ctx, time.Until(availableAt)); err != nil {
-			return err
-		}
-
-		c.throttleMu.Lock()
-		coolingDown := time.Now().Before(c.cooldownUntil)
-		c.throttleMu.Unlock()
-		if !coolingDown {
-			return nil
-		}
-	}
+	return c.limiter.Wait(ctx, c.minInterval)
 }
 
 func tmdbRetryDelay(resp *http.Response, fallback time.Duration) time.Duration {
@@ -190,15 +160,7 @@ func (c *tmdbClient) beginSharedCooldown(delay time.Duration) {
 		c.requestLimiter.beginSharedCooldown(delay)
 		return
 	}
-	if delay <= 0 {
-		return
-	}
-	until := time.Now().Add(delay)
-	c.throttleMu.Lock()
-	if until.After(c.cooldownUntil) {
-		c.cooldownUntil = until
-	}
-	c.throttleMu.Unlock()
+	c.limiter.BeginCooldown(delay)
 }
 
 func newTMDBClient(apiKey, language string, httpc *http.Client, cache *fileCache) *tmdbClient {

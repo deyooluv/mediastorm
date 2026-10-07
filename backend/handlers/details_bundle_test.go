@@ -778,6 +778,20 @@ func TestDetailsBundleHandler_SimilarOverlapsDetails(t *testing.T) {
 	}
 }
 
+func TestInteractiveMetadataPriorityMarksRequestContext(t *testing.T) {
+	var interactive bool
+	wrapped := handlers.InteractiveMetadataPriority(func(_ http.ResponseWriter, r *http.Request) {
+		interactive = metadatapkg.IsInteractivePriority(r.Context())
+	})
+	wrapped(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/users/user1/details-bundle", nil))
+	if !interactive {
+		t.Fatal("expected wrapped handler to see an interactive-priority context")
+	}
+	if metadatapkg.IsInteractivePriority(context.Background()) {
+		t.Fatal("expected a plain context not to be interactive")
+	}
+}
+
 func TestDetailsBundleHandler_UserNotFound(t *testing.T) {
 	h := handlers.NewDetailsBundleHandler(
 		&mockMetadataServiceDetailsBundle{},

@@ -493,6 +493,15 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 	writeCompressedJSON(w, r, resp, "details-bundle")
 }
 
+// InteractiveMetadataPriority marks a request's upstream metadata calls as
+// interactive, so shared provider rate limiters serve them ahead of queued
+// background enrichment. Use it only for routes a person waits on (details).
+func InteractiveMetadataPriority(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		next(w, r.WithContext(metadatapkg.WithInteractivePriority(r.Context())))
+	}
+}
+
 // Options handles CORS preflight for the details-bundle endpoint.
 func (h *DetailsBundleHandler) Options(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
