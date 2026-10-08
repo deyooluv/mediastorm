@@ -302,6 +302,15 @@ func (h *LogsHandler) UploadFrontendLogs(w http.ResponseWriter, r *http.Request)
 		h.respondError(w, fmt.Sprintf("failed to store frontend logs: %v", err), http.StatusInternalServerError)
 		return
 	}
+	// The app deletes its pending native crash batch once an upload succeeds, so
+	// fail the upload rather than acknowledge a batch that was not retained.
+	if stored, err := h.retainNativeDiagnostics(snapshot); err != nil {
+		h.logger.Printf("[logs] Failed to retain native diagnostics for client %s: %v", clientID, err)
+		h.respondError(w, fmt.Sprintf("failed to store native diagnostics: %v", err), http.StatusInternalServerError)
+		return
+	} else if stored {
+		h.logger.Printf("[logs] Retained native crash diagnostics for client %s", truncateLogIdentifier(clientID))
+	}
 	if h.clients != nil {
 		if err := h.clients.UpdateLastSeen(clientID); err != nil {
 			h.logger.Printf("[logs] Failed to update last seen for client %s: %v", clientID, err)
@@ -613,6 +622,10 @@ func (h *LogsHandler) buildCombinedLogPackage(frontendLogs string, snapshot *fro
 	}
 	combined.WriteString("\n")
 
+	if snapshot != nil {
+		h.writeNativeDiagnosticsSection(&combined, []string{snapshot.ClientID})
+	}
+
 	combined.WriteString("═══════════════════════════════════════════════════════════════════════\n")
 	combined.WriteString("                           BACKEND LOGS\n")
 	combined.WriteString(fmt.Sprintf("                     (last %d lines)\n", maxLogLines))
@@ -655,6 +668,12 @@ func (h *LogsHandler) buildCombinedStoredLogsPackage(frontendLogs string, summar
 		combined.WriteString(fmt.Sprintf("Frontend Clients Included: %d\n", len(summaries)))
 	}
 	combined.WriteString("\n")
+
+	clientIDs := make([]string, 0, len(summaries))
+	for _, summary := range summaries {
+		clientIDs = append(clientIDs, summary.ClientID)
+	}
+	h.writeNativeDiagnosticsSection(&combined, clientIDs)
 
 	combined.WriteString("═══════════════════════════════════════════════════════════════════════\n")
 	combined.WriteString("                           BACKEND LOGS\n")
