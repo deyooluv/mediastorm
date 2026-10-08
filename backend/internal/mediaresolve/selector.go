@@ -60,6 +60,11 @@ var (
 	episodeNumberPattern   = regexp.MustCompile(`(?i)[-_\s/](\d{1,3})[-_\s\[\.]`)  // Matches " - 01 - ", "_01_", "_01[", "_01.", "/01 ", " - 001 - " for season packs
 	seasonIndicatorPattern = regexp.MustCompile(`(?i)season[\s._-]*(\d{1,2})`)     // Matches "Season 02", "Season.02", "season_02"
 
+	// Portuguese/Spanish labels mark the season as T (Temporada): "T07·E09",
+	// "T07E09", "T7 E9". The T must start a token so words ending in t
+	// ("Part2 E05") don't parse as a season.
+	localizedEpisodeCodePattern = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}])t(\d{1,2})\s*[·._-]?\s*e(\d{1,4})`)
+
 	// Absolute episode patterns for anime (3-4 digit episode numbers)
 	// These patterns are specifically designed to match anime release formats
 	// while avoiding false positives from resolutions (1080p), years (2024), etc.
@@ -482,6 +487,9 @@ func parseEpisodeFromString(value string) (int, int, bool) {
 		return 0, 0, false
 	}
 	matches := episodeCodePattern.FindStringSubmatch(value)
+	if len(matches) != 3 {
+		matches = localizedEpisodeCodePattern.FindStringSubmatch(value)
+	}
 	if len(matches) != 3 {
 		return 0, 0, false
 	}

@@ -3090,6 +3090,30 @@ func prequeueCandidateAttempt(index int, result models.NZBResult, outcome string
 	}
 }
 
+// prequeueCandidateAbsoluteEpisodeMismatch reports whether a single-episode
+// candidate's label carries an episode number that contradicts the target's
+// SxxExx and absolute numbering (anime absolute releases such as
+// "One Piece - 1153"). It returns the parsed label number for logging.
+func prequeueCandidateAbsoluteEpisodeMismatch(result models.NZBResult, target *models.EpisodeReference) (int, bool) {
+	if target == nil || target.AbsoluteEpisodeNumber <= 0 || result.EpisodeCount > 1 {
+		return 0, false
+	}
+	parsedEp, hasEpisode := mediaresolve.ParseAbsoluteEpisodeNumber(result.Title)
+	if !hasEpisode || parsedEp == target.AbsoluteEpisodeNumber {
+		return parsedEp, false
+	}
+	episodeCode := mediaresolve.EpisodeCode{Season: target.SeasonNumber, Episode: target.EpisodeNumber}
+	if result.Attributes["mappedCatalogEpisode"] == fmt.Sprintf("S%02dE%02d", episodeCode.Season, episodeCode.Episode) && result.Attributes["mappedCatalogNumbering"] == models.EpisodeNumberingKey(target.Numbering) {
+		if season, err := strconv.Atoi(result.Attributes["targetSeason"]); err == nil && season > 0 {
+			episodeCode.Season = season
+		}
+		if episode, err := strconv.Atoi(result.Attributes["targetEpisode"]); err == nil && episode > 0 {
+			episodeCode.Episode = episode
+		}
+	}
+	return parsedEp, !mediaresolve.CandidateMatchesEpisode(result.Title, episodeCode)
+}
+
 // resolveCandidates resolves the candidate source and returns the winning
 // resolution together with the candidate and probe data the rest of the worker
 // needs. In the default mode candidates are attempted sequentially in ranked
@@ -3127,28 +3151,10 @@ func (h *PrequeueHandler) resolveCandidates(ctx context.Context, prequeueID stri
 			}
 		}()
 
-		// Check episode match for anime absolute numbering
-		if opts.targetEpisode != nil && opts.targetEpisode.AbsoluteEpisodeNumber > 0 {
-			if result.EpisodeCount <= 1 {
-				parsedEp, hasEpisode := mediaresolve.ParseAbsoluteEpisodeNumber(result.Title)
-				if hasEpisode {
-					episodeCode := mediaresolve.EpisodeCode{Season: opts.targetEpisode.SeasonNumber, Episode: opts.targetEpisode.EpisodeNumber}
-					if result.Attributes["mappedCatalogEpisode"] == fmt.Sprintf("S%02dE%02d", episodeCode.Season, episodeCode.Episode) && result.Attributes["mappedCatalogNumbering"] == models.EpisodeNumberingKey(opts.targetEpisode.Numbering) {
-						if season, err := strconv.Atoi(result.Attributes["targetSeason"]); err == nil && season > 0 {
-							episodeCode.Season = season
-						}
-						if episode, err := strconv.Atoi(result.Attributes["targetEpisode"]); err == nil && episode > 0 {
-							episodeCode.Episode = episode
-						}
-					}
-					matchesSXXEXX := mediaresolve.CandidateMatchesEpisode(result.Title, episodeCode)
-					if !matchesSXXEXX && parsedEp != opts.targetEpisode.AbsoluteEpisodeNumber {
-						log.Printf("[prequeue] Skipping result [%d] - episode %d doesn't match target (S%02dE%02d/abs:%d): %s",
-							i, parsedEp, opts.targetEpisode.SeasonNumber, opts.targetEpisode.EpisodeNumber, opts.targetEpisode.AbsoluteEpisodeNumber, result.Title)
-						return nil, nil, nil
-					}
-				}
-			}
+		if parsedEp, mismatch := prequeueCandidateAbsoluteEpisodeMismatch(result, opts.targetEpisode); mismatch {
+			log.Printf("[prequeue] Skipping result [%d] - episode %d doesn't match target (S%02dE%02d/abs:%d): %s",
+				i, parsedEp, opts.targetEpisode.SeasonNumber, opts.targetEpisode.EpisodeNumber, opts.targetEpisode.AbsoluteEpisodeNumber, result.Title)
+			return nil, nil, nil
 		}
 
 		h.updatePrequeueStageDetail(prequeueID, "resolving_candidate", result.Title)

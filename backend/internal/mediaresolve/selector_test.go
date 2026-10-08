@@ -394,6 +394,12 @@ func TestCandidateMatchesEpisode(t *testing.T) {
 		{"Lowercase sxxexx", "show.s01e05.mkv", EpisodeCode{Season: 1, Episode: 5}, true},
 		{"With spaces", "Show S01 E05 1080p.mkv", EpisodeCode{Season: 1, Episode: 5}, true},
 
+		// Portuguese/Spanish T (Temporada) season marker
+		{"Temporada middle dot", "🎬 Aeroporto Area Restrita\n🥏 T07·E09\n🌊 Azure\n🌎 Português", EpisodeCode{Season: 7, Episode: 9}, true},
+		{"Temporada compact", "Serie.T07E09.1080p.mkv", EpisodeCode{Season: 7, Episode: 9}, true},
+		{"Temporada wrong episode", "🥏 T07·E10", EpisodeCode{Season: 7, Episode: 9}, false},
+		{"Word ending in t is not a season", "Show Part2 E05.mkv", EpisodeCode{Season: 2, Episode: 5}, false},
+
 		// Alternative episode patterns (assuming season)
 		{"Ep format in season pack", "Ep.05.mkv", EpisodeCode{Season: 1, Episode: 5}, true},
 		{"Episode keyword", "Episode 10.mkv", EpisodeCode{Season: 1, Episode: 10}, true},
@@ -695,6 +701,8 @@ func TestExtractEpisodeCode(t *testing.T) {
 		{"Standard SXXEXX", []string{"Show.S01E05.mkv"}, 1, 5, true},
 		{"Lowercase", []string{"show.s02e10.mkv"}, 2, 10, true},
 		{"With spaces", []string{"Show S03 E15"}, 3, 15, true},
+		{"Temporada", []string{"🥏 T07·E09"}, 7, 9, true},
+		{"SXXEXX preferred over Temporada", []string{"Show.S02E03.T07E09"}, 2, 3, true},
 		{"No match", []string{"Show.1080p.mkv"}, 0, 0, false},
 		{"Empty", []string{""}, 0, 0, false},
 	}
