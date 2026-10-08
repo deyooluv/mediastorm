@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"novastream/internal/auth"
 	"novastream/internal/requestsecurity"
 	"novastream/models"
 	metadatapkg "novastream/services/metadata"
@@ -40,16 +42,69 @@ type stremioManifestIngestionResponse struct {
 	Catalogs    []stremioManifestCatalogResponse `json:"catalogs"`
 }
 
-func newStremioShelfHTTPClient() *http.Client {
-	return requestsecurity.NewSafeHTTPClient(15*time.Second, 5, nil)
+func newStremioShelfHTTPClient(policyProvider func() requestsecurity.RestrictedHostPolicy) *http.Client {
+	return requestsecurity.NewSafeHTTPClientWithPolicyProvider(15*time.Second, 5, policyProvider)
 }
 
 func (h *MetadataHandler) stremioShelfClient() *http.Client {
 	if h.stremioHTTPClient != nil {
 		return h.stremioHTTPClient
 	}
-	h.stremioHTTPClient = newStremioShelfHTTPClient()
+	h.stremioHTTPClient = newStremioShelfHTTPClient(h.stremioShelfHostPolicy)
 	return h.stremioHTTPClient
+}
+
+// stremioShelfHostPolicy permits private-network add-ons (for example a
+// Docker-hosted AIOMetadata) only when the master admin configured them: the
+// origin of a global Stremio home shelf, or any configured provider/private
+// media origin. Catalog requests carry a client-supplied manifestUrl, so
+// profile-level shelves are deliberately not trusted here.
+func (h *MetadataHandler) stremioShelfHostPolicy() requestsecurity.RestrictedHostPolicy {
+	if h.CfgManager == nil {
+		return nil
+	}
+	base := configuredProviderHostPolicy(h.CfgManager)
+	allowed := make(map[string]struct{})
+	if settings, err := h.CfgManager.Load(); err == nil {
+		for _, shelf := range settings.HomeShelves.Shelves {
+			if !strings.EqualFold(strings.TrimSpace(shelf.Type), "stremio") {
+				continue
+			}
+			manifestURL, _, err := normalizeStremioManifestInput(shelf.AddonManifestURL)
+			if err != nil {
+				continue
+			}
+			if key, ok := providerOriginKey(manifestURL); ok {
+				allowed[key] = struct{}{}
+			}
+		}
+	}
+	return func(hostname, port string) bool {
+		if _, ok := allowed[privateMediaEndpointKey(hostname, port)]; ok {
+			return true
+		}
+		return base(hostname, port)
+	}
+}
+
+// stremioManifestIngestionClient returns the client used while an admin adds a
+// new Stremio shelf. The shelf is not saved yet, so a master admin's typed
+// manifest origin is trusted for this request the same way a typed indexer or
+// scraper URL is. Origins discovered via add-on directory pages are not.
+func (h *MetadataHandler) stremioManifestIngestionClient(r *http.Request, manifestURL string) *http.Client {
+	key, ok := providerOriginKey(manifestURL)
+	if !ok || !auth.IsMaster(r) {
+		return h.stremioShelfClient()
+	}
+	return newStremioShelfHTTPClient(func() requestsecurity.RestrictedHostPolicy {
+		base := h.stremioShelfHostPolicy()
+		return func(hostname, port string) bool {
+			if privateMediaEndpointKey(hostname, port) == key {
+				return true
+			}
+			return base != nil && base(hostname, port)
+		}
+	})
 }
 
 // normalizeStremioManifestInput accepts a manifest URL, an addon base URL, a
@@ -168,11 +223,14 @@ func resolveStremioDirectoryManifestURL(ctx context.Context, client *http.Client
 	return extractStremioDirectoryManifestURL(body)
 }
 
-func (h *MetadataHandler) loadStremioManifest(ctx context.Context, rawURL string) (*stremioManifest, string, string, error) {
+func (h *MetadataHandler) loadStremioManifest(ctx context.Context, client *http.Client, rawURL string) (*stremioManifest, string, string, error) {
 	if pageURL, isDirectoryPage, err := stremioAddonDirectoryPageURL(rawURL); err != nil {
 		return nil, "", "", err
 	} else if isDirectoryPage {
-		rawURL, err = resolveStremioDirectoryManifestURL(ctx, h.stremioShelfClient(), pageURL)
+		// A directory page names a third-party manifest, so only the shared
+		// admin-configured policy applies to it.
+		client = h.stremioShelfClient()
+		rawURL, err = resolveStremioDirectoryManifestURL(ctx, client, pageURL)
 		if err != nil {
 			return nil, "", "", fmt.Errorf("resolve Stremio add-on page: %w", err)
 		}
@@ -182,7 +240,10 @@ func (h *MetadataHandler) loadStremioManifest(ctx context.Context, rawURL string
 		return nil, "", "", err
 	}
 	var manifest stremioManifest
-	if err := getStremioShelfJSON(ctx, h.stremioShelfClient(), manifestURL, &manifest); err != nil {
+	if err := getStremioShelfJSON(ctx, client, manifestURL, &manifest); err != nil {
+		if errors.Is(err, requestsecurity.ErrRestrictedOutboundAddress) {
+			return nil, "", "", fmt.Errorf("fetch Stremio manifest: %w (private add-ons must be added by the server admin, or listed in Allowed Private Media Origins)", err)
+		}
 		return nil, "", "", fmt.Errorf("fetch Stremio manifest: %w", err)
 	}
 	if len(manifest.Catalogs) == 0 {
@@ -195,16 +256,19 @@ func (h *MetadataHandler) loadStremioManifest(ctx context.Context, rawURL string
 // as independent home shelves.
 func (h *MetadataHandler) StremioManifest(w http.ResponseWriter, r *http.Request) {
 	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	client := h.stremioShelfClient()
 	if _, isDirectoryPage, directoryErr := stremioAddonDirectoryPageURL(rawURL); directoryErr != nil {
 		writeJSONError(w, directoryErr.Error(), http.StatusBadRequest)
 		return
 	} else if !isDirectoryPage {
-		if _, _, err := normalizeStremioManifestInput(rawURL); err != nil {
+		typedManifestURL, _, err := normalizeStremioManifestInput(rawURL)
+		if err != nil {
 			writeJSONError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		client = h.stremioManifestIngestionClient(r, typedManifestURL)
 	}
-	manifest, manifestURL, _, err := h.loadStremioManifest(r.Context(), rawURL)
+	manifest, manifestURL, _, err := h.loadStremioManifest(r.Context(), client, rawURL)
 	if err != nil {
 		writeJSONError(w, err.Error(), http.StatusBadGateway)
 		return

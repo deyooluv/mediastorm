@@ -44,7 +44,7 @@ func (h *MetadataHandler) loadStremioShelfCatalogPrefix(ctx context.Context, raw
 		return entry, ctx.Err()
 	}
 	if !cached {
-		manifest, _, baseURL, err := h.loadStremioManifest(ctx, manifestURL)
+		manifest, _, baseURL, err := h.loadStremioManifest(ctx, h.stremioShelfClient(), manifestURL)
 		if err != nil {
 			return stremioShelfCatalogCacheEntry{}, err
 		}

@@ -3,6 +3,7 @@ package requestsecurity
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +14,10 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrRestrictedOutboundAddress reports that an outbound host resolved only to
+// local or private addresses that the active policy does not allow.
+var ErrRestrictedOutboundAddress = errors.New("outbound host resolves to a restricted address")
 
 var embeddedHTTPURL = regexp.MustCompile(`https?://[^\s\"'<>]+`)
 
@@ -251,7 +256,7 @@ func resolveAllowedIPs(ctx context.Context, hostname, port string, allowRestrict
 		}
 	}
 	if len(allowed) == 0 {
-		return nil, fmt.Errorf("outbound host resolves to a restricted address")
+		return nil, ErrRestrictedOutboundAddress
 	}
 	return allowed, nil
 }

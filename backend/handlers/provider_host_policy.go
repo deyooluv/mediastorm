@@ -12,24 +12,8 @@ import (
 func configuredProviderHostPolicy(configManager ConfigProvider) requestsecurity.RestrictedHostPolicy {
 	allowed := make(map[string]struct{})
 	addURLOrigin := func(raw string) {
-		parsed, err := url.Parse(strings.TrimSpace(raw))
-		if err != nil || parsed == nil {
-			return
-		}
-		scheme := strings.ToLower(parsed.Scheme)
-		if parsed.Hostname() != "" && (scheme == "http" || scheme == "https") {
-			port := parsed.Port()
-			if port == "" {
-				switch scheme {
-				case "http":
-					port = "80"
-				case "https":
-					port = "443"
-				}
-			}
-			if port != "" {
-				allowed[privateMediaEndpointKey(parsed.Hostname(), port)] = struct{}{}
-			}
+		if key, ok := providerOriginKey(raw); ok {
+			allowed[key] = struct{}{}
 		}
 	}
 	if configManager != nil {
@@ -79,6 +63,29 @@ func configuredProviderHostPolicy(configManager ConfigProvider) requestsecurity.
 		_, ok := allowed[privateMediaEndpointKey(hostname, port)]
 		return ok
 	}
+}
+
+// providerOriginKey returns the host:port endpoint key for an HTTP(S) URL,
+// applying the scheme's default port when none is given.
+func providerOriginKey(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Hostname() == "" {
+		return "", false
+	}
+	port := parsed.Port()
+	if port == "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", false
+		}
+	} else if scheme := strings.ToLower(parsed.Scheme); scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	return privateMediaEndpointKey(parsed.Hostname(), port), true
 }
 
 func privateMediaEndpointKey(hostname, port string) string {

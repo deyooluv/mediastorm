@@ -221,14 +221,15 @@ type MetadataHandler struct {
 }
 
 func NewMetadataHandler(s metadataService, cfgManager *config.Manager) *MetadataHandler {
-	return &MetadataHandler{
+	h := &MetadataHandler{
 		Service:              s,
 		CfgManager:           cfgManager,
-		stremioHTTPClient:    newStremioShelfHTTPClient(),
 		personalizedCache:    make(map[string]personalizedRecommendationsCacheEntry),
 		personalizedInFlight: make(map[string]*personalizedRecommendationsBuild),
 		stremioCatalogCache:  make(map[string]stremioShelfCatalogCacheEntry),
 	}
+	h.stremioHTTPClient = newStremioShelfHTTPClient(h.stremioShelfHostPolicy)
+	return h
 }
 
 // SetUserSettingsProvider sets the user settings provider for per-user settings.
