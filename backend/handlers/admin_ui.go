@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -2438,9 +2439,11 @@ func (h *AdminUIHandler) buildStreamsPayload(isAdmin bool, accountID string) ([]
 
 	// Build user name -> ID map for reverse lookup
 	nameToUserID := make(map[string]string)
+	userIDToName := make(map[string]string)
 	if h.usersService != nil {
 		for _, user := range h.usersService.ListAll() {
 			nameToUserID[strings.ToLower(user.Name)] = user.ID
+			userIDToName[user.ID] = user.Name
 		}
 	}
 
@@ -2746,6 +2749,16 @@ func (h *AdminUIHandler) buildStreamsPayload(isAdmin bool, accountID string) ([]
 		streams = append(streams, streamData)
 	}
 
+	// Direct-link playbacks: the client streams from the provider, so the row is
+	// driven entirely by its heartbeats. Ones already represented by a tracked
+	// transport stream or an HLS session are excluded upstream.
+	for _, playback := range dashboardDirectLinkPlaybacks(h.hlsManager) {
+		if !isAdmin && !allowedProfileIDs[playback.ProfileID] {
+			continue
+		}
+		streams = append(streams, directLinkDashboardRow(playback, userIDToName[playback.ProfileID], clientsByID))
+	}
+
 	// A single native player (KSPlayer/ExoPlayer) opens many concurrent/short-lived
 	// byte-range connections for one file, each registered as its own tracked stream.
 	// Collapse those into one dashboard row per playback so a single playback doesn't
@@ -2778,6 +2791,53 @@ func (h *AdminUIHandler) buildStreamsPayload(isAdmin bool, accountID string) ([]
 		"globalVODLimit":    globalVODLimit,
 		"globalVODCurrent":  globalVODCurrent,
 	})
+}
+
+// directLinkDashboardRow renders a direct-link playback as a dashboard row.
+func directLinkDashboardRow(playback DirectLinkPlayback, profileName string, clientsByID map[string]models.Client) map[string]interface{} {
+	meta := playback.MediaMetadata
+	percent := 0.0
+	if playback.Duration > 0 {
+		percent = math.Min(100, playback.Position/playback.Duration*100)
+	}
+	row := map[string]interface{}{
+		"id":               playback.ID,
+		"type":             directLinkStreamType,
+		"direct_link":      true,
+		"is_live":          false,
+		"service_type":     dashboardStreamServiceType(false, "", playback.Path),
+		"debrid_provider":  dashboardDebridProvider("", "", playback.Path),
+		"path":             playback.Path,
+		"filename":         playback.Filename,
+		"item_id":          meta.ItemID,
+		"profile_id":       playback.ProfileID,
+		"profile_name":     profileName,
+		"account_id":       playback.AccountID,
+		"client_ip":        playback.ClientIP,
+		"created_at":       playback.StartTime,
+		"last_access":      playback.LastHeartbeat,
+		"last_updated":     playback.LastHeartbeat,
+		"duration":         playback.Duration,
+		"current_position": playback.Position,
+		"percent_watched":  percent,
+		"bytes_streamed":   int64(0),
+		"throughput_bps":   int64(0),
+		"media_type":       meta.MediaType,
+		"title":            meta.Title,
+		"year":             meta.Year,
+		"season_number":    meta.SeasonNumber,
+		"episode_number":   meta.EpisodeNumber,
+		"episode_name":     meta.EpisodeName,
+		"posterUrl":        meta.PosterURL,
+		"externalIds":      streamExternalIDs(meta.ItemID, meta.ExternalIDs),
+	}
+	if playback.IsPaused {
+		row["is_paused"] = true
+	} else if playback.IsBuffering {
+		row["is_buffering"] = true
+	}
+	addDashboardDeviceInfo(row, playback.ClientID, clientsByID)
+	return row
 }
 
 // dashboardProgressUpdatedAt returns an interpolation anchor only for a fresh
@@ -3547,6 +3607,27 @@ func (h *AdminUIHandler) TerminateStream(w http.ResponseWriter, r *http.Request)
 	}
 
 	tracker := GetStreamTracker()
+	if playback, ok := tracker.GetDirectLinkPlayback(streamID); ok {
+		if !isAdmin && playback.AccountID != accountID && !h.profileBelongsToAccount(playback.ProfileID, accountID) {
+			http.Error(w, `{"error":"stream not found"}`, http.StatusNotFound)
+			return
+		}
+		// The backend has no transport to cut; the client is told to stop on
+		// its next heartbeat.
+		if !tracker.MarkStopPlaybackForProfileMedia(playback.ProfileID, "", playback.MediaMetadata.MediaType, playback.MediaMetadata.ItemID) {
+			http.Error(w, `{"error":"stream cannot be controlled"}`, http.StatusBadRequest)
+			return
+		}
+		log.Printf("[admin-ui] marked direct-link playback %s to stop on heartbeat", streamID)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"terminated": true,
+			"id":         streamID,
+			"type":       directLinkStreamType,
+		})
+		return
+	}
+
 	stream, exists := tracker.GetStream(streamID)
 	if !exists {
 		http.Error(w, `{"error":"stream not found"}`, http.StatusNotFound)

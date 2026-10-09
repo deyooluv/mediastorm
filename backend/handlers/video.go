@@ -1028,6 +1028,94 @@ func (h *VideoHandler) UpdateSharePlaybackProgress(w http.ResponseWriter, r *htt
 	})
 }
 
+// enforceVODStreamLimits applies the global, per-profile and per-account
+// concurrent VOD stream limits to a playback request. It writes the rejection
+// response and returns false when the request would open a new playback slot
+// beyond a limit. Only GET is checked so HEAD metadata probes are never blocked.
+func (h *VideoHandler) enforceVODStreamLimits(w http.ResponseWriter, r *http.Request, cleanPath string) bool {
+	// Enforce global concurrent stream limit (VOD only).
+	if r.Method == http.MethodGet && h.configManager != nil {
+		if globalSettings, err := h.configManager.Load(); err == nil && globalSettings.Playback.MaxConcurrentStreams > 0 {
+			tracker := GetStreamTracker()
+			usage, exceeds := tracker.WouldExceedGlobalLimit(r, cleanPath, globalSettings.Playback.MaxConcurrentStreams)
+			if exceeds {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"code":           "STREAM_LIMIT_REACHED",
+					"message":        fmt.Sprintf("Server stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
+					"currentStreams": usage.CurrentStreams,
+					"maxStreams":     usage.MaxStreams,
+					"scope":          "global",
+				})
+				return false
+			}
+		}
+	}
+
+	// Enforce per-profile and per-account concurrent stream limits (VOD only).
+	// Only check on GET (not HEAD) to avoid blocking metadata probes.
+	if r.Method == http.MethodGet && h.usersSvc != nil && h.accountsSvc != nil {
+		profileID := r.URL.Query().Get("profileId")
+		if profileID == "" {
+			profileID = r.URL.Query().Get("userId")
+		}
+		accountIDForLimit := auth.GetAccountID(r)
+		if profileID != "" {
+			user, ok := h.usersSvc.Get(profileID)
+			if !ok || (!auth.IsMaster(r) && accountIDForLimit != "" && user.AccountID != accountIDForLimit) {
+				http.Error(w, "profile not found", http.StatusNotFound)
+				return false
+			}
+			if ok {
+				accountIDForLimit = user.AccountID
+				// Check per-profile limit first
+				if h.userSettingsSvc != nil {
+					if settings, err := h.userSettingsSvc.Get(profileID); err == nil && settings != nil {
+						if settings.Playback.MaxConcurrentStreams != nil && *settings.Playback.MaxConcurrentStreams > 0 {
+							tracker := GetStreamTracker()
+							usage, exceeds := tracker.WouldExceedProfileLimit(r, cleanPath, profileID, *settings.Playback.MaxConcurrentStreams)
+							if exceeds {
+								w.Header().Set("Content-Type", "application/json")
+								w.WriteHeader(http.StatusTooManyRequests)
+								_ = json.NewEncoder(w).Encode(map[string]interface{}{
+									"code":           "STREAM_LIMIT_REACHED",
+									"message":        fmt.Sprintf("Profile stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
+									"currentStreams": usage.CurrentStreams,
+									"maxStreams":     usage.MaxStreams,
+									"scope":          "profile",
+								})
+								return false
+							}
+						}
+					}
+				}
+			}
+		}
+		// Enforce the authenticated account limit even when optional profile
+		// parameters are omitted.
+		if accountIDForLimit != "" {
+			if account, ok := h.accountsSvc.Get(accountIDForLimit); ok && account.MaxStreams > 0 {
+				tracker := GetStreamTracker()
+				usage, exceeds := tracker.WouldExceedAccountLimit(r, cleanPath, accountIDForLimit, account.MaxStreams)
+				if exceeds {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"code":           "STREAM_LIMIT_REACHED",
+						"message":        fmt.Sprintf("Account stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
+						"currentStreams": usage.CurrentStreams,
+						"maxStreams":     usage.MaxStreams,
+						"scope":          "account",
+					})
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 // StreamVideo serves registered streams via the local provider.
 func (h *VideoHandler) StreamVideo(w http.ResponseWriter, r *http.Request) {
 	// Handle OPTIONS requests for CORS
@@ -1060,85 +1148,8 @@ func (h *VideoHandler) StreamVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce global concurrent stream limit (VOD only).
-	if r.Method == http.MethodGet && h.configManager != nil {
-		if globalSettings, err := h.configManager.Load(); err == nil && globalSettings.Playback.MaxConcurrentStreams > 0 {
-			tracker := GetStreamTracker()
-			usage, exceeds := tracker.WouldExceedGlobalLimit(r, cleanPath, globalSettings.Playback.MaxConcurrentStreams)
-			if exceeds {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTooManyRequests)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"code":           "STREAM_LIMIT_REACHED",
-					"message":        fmt.Sprintf("Server stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
-					"currentStreams": usage.CurrentStreams,
-					"maxStreams":     usage.MaxStreams,
-					"scope":          "global",
-				})
-				return
-			}
-		}
-	}
-
-	// Enforce per-profile and per-account concurrent stream limits (VOD only).
-	// Only check on GET (not HEAD) to avoid blocking metadata probes.
-	if r.Method == http.MethodGet && h.usersSvc != nil && h.accountsSvc != nil {
-		profileID := r.URL.Query().Get("profileId")
-		if profileID == "" {
-			profileID = r.URL.Query().Get("userId")
-		}
-		accountIDForLimit := auth.GetAccountID(r)
-		if profileID != "" {
-			user, ok := h.usersSvc.Get(profileID)
-			if !ok || (!auth.IsMaster(r) && accountIDForLimit != "" && user.AccountID != accountIDForLimit) {
-				http.Error(w, "profile not found", http.StatusNotFound)
-				return
-			}
-			if ok {
-				accountIDForLimit = user.AccountID
-				// Check per-profile limit first
-				if h.userSettingsSvc != nil {
-					if settings, err := h.userSettingsSvc.Get(profileID); err == nil && settings != nil {
-						if settings.Playback.MaxConcurrentStreams != nil && *settings.Playback.MaxConcurrentStreams > 0 {
-							tracker := GetStreamTracker()
-							usage, exceeds := tracker.WouldExceedProfileLimit(r, cleanPath, profileID, *settings.Playback.MaxConcurrentStreams)
-							if exceeds {
-								w.Header().Set("Content-Type", "application/json")
-								w.WriteHeader(http.StatusTooManyRequests)
-								_ = json.NewEncoder(w).Encode(map[string]interface{}{
-									"code":           "STREAM_LIMIT_REACHED",
-									"message":        fmt.Sprintf("Profile stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
-									"currentStreams": usage.CurrentStreams,
-									"maxStreams":     usage.MaxStreams,
-									"scope":          "profile",
-								})
-								return
-							}
-						}
-					}
-				}
-			}
-		}
-		// Enforce the authenticated account limit even when optional profile
-		// parameters are omitted.
-		if accountIDForLimit != "" {
-			if account, ok := h.accountsSvc.Get(accountIDForLimit); ok && account.MaxStreams > 0 {
-				tracker := GetStreamTracker()
-				usage, exceeds := tracker.WouldExceedAccountLimit(r, cleanPath, accountIDForLimit, account.MaxStreams)
-				if exceeds {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusTooManyRequests)
-					_ = json.NewEncoder(w).Encode(map[string]interface{}{
-						"code":           "STREAM_LIMIT_REACHED",
-						"message":        fmt.Sprintf("Account stream limit reached (%d/%d)", usage.CurrentStreams, usage.MaxStreams),
-						"currentStreams": usage.CurrentStreams,
-						"maxStreams":     usage.MaxStreams,
-						"scope":          "account",
-					})
-					return
-				}
-			}
-		}
+	if !h.enforceVODStreamLimits(w, r, cleanPath) {
+		return
 	}
 
 	// Determine whether transmuxing is desired and possible
@@ -7297,6 +7308,11 @@ func (h *VideoHandler) GetDirectURL(w http.ResponseWriter, r *http.Request) {
 	if !h.requireLibraryStreamAccess(w, r, path) {
 		return
 	}
+	// A direct URL starts a playback the backend never proxies, so it must
+	// respect the same concurrent stream limits as proxied playback.
+	if !h.enforceVODStreamLimits(w, r, path) {
+		return
+	}
 
 	// Check if provider supports direct URLs
 	directProvider, ok := h.streamer.(streaming.DirectURLProvider)
@@ -7322,6 +7338,7 @@ func (h *VideoHandler) GetDirectURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	videoTracef("[video] GetDirectURL: path=%q resolved direct URL", path)
+	GetStreamTracker().RecordDirectURLIssued(path, auth.GetAccountID(r))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

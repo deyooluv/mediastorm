@@ -163,7 +163,7 @@ func (h *AdminHandler) ClearAllPrequeueEntries(w http.ResponseWriter, r *http.Re
 // StreamInfo represents information about an active stream
 type StreamInfo struct {
 	ID            string    `json:"id"`
-	Type          string    `json:"type"` // "hls", "direct", or "debrid"
+	Type          string    `json:"type"` // "hls", "direct", "direct_link", or "debrid"
 	Path          string    `json:"path"`
 	OriginalPath  string    `json:"original_path,omitempty"`
 	Filename      string    `json:"filename"`
@@ -532,6 +532,38 @@ func (h *AdminHandler) ActiveStreams() StreamsResponse {
 		directCount++
 	}
 
+	// Direct-link playbacks stream from the provider, so they are known only
+	// from heartbeats. The tracker already drops any that a transport stream
+	// represents, and HLS-backed ones are dropped here.
+	for _, playback := range dashboardDirectLinkPlaybacks(h.hlsManager) {
+		profileName := userNames[playback.ProfileID]
+		meta := playback.MediaMetadata
+		info := StreamInfo{
+			ID:              playback.ID,
+			Type:            directLinkStreamType,
+			Path:            playback.Path,
+			Filename:        playback.Filename,
+			ClientIP:        playback.ClientIP,
+			ProfileID:       playback.ProfileID,
+			ProfileName:     profileName,
+			CreatedAt:       playback.StartTime,
+			LastAccess:      playback.LastHeartbeat,
+			Duration:        playback.Duration,
+			CurrentPosition: playback.Position,
+			ItemID:          meta.ItemID,
+			MediaType:       meta.MediaType,
+			Title:           meta.Title,
+			Year:            meta.Year,
+			SeasonNumber:    meta.SeasonNumber,
+			EpisodeNumber:   meta.EpisodeNumber,
+			EpisodeName:     meta.EpisodeName,
+			PosterURL:       meta.PosterURL,
+			ExternalIDs:     meta.ExternalIDs,
+		}
+		rawStreams = append(rawStreams, rawStream{info: info, streamID: playback.ID})
+		directCount++
+	}
+
 	// Build reverse lookup: user name -> user ID for progress matching
 	nameToUserID := make(map[string]string)
 	for userID, name := range userNames {
@@ -676,8 +708,10 @@ func (h *AdminHandler) ActiveStreams() StreamsResponse {
 	}
 
 	for _, info := range consolidated {
-		// Skip streams with 0 bytes transferred (not actually playing)
-		if info.BytesStreamed == 0 {
+		// Skip streams with 0 bytes transferred (not actually playing). Direct
+		// links never move bytes through the backend; a fresh heartbeat is
+		// their evidence of playback.
+		if info.BytesStreamed == 0 && info.Type != directLinkStreamType {
 			continue
 		}
 

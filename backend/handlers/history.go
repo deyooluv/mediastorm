@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"novastream/internal/auth"
 	"novastream/internal/mediaidentity"
 	"novastream/models"
 	"novastream/services/history"
@@ -622,6 +623,9 @@ func (h *HistoryHandler) UpdatePlaybackProgress(w http.ResponseWriter, r *http.R
 		return
 	}
 	GetStreamTracker().AssociateClientWithPlayback(userID, update, requestClientID(r))
+	// Clients that stream straight from the provider via /video/direct-url are
+	// only visible through these heartbeats.
+	GetStreamTracker().ObserveDirectLinkHeartbeat(userID, h.profileAccountID(r, userID), requestClientID(r), getClientIP(r), update)
 	allowedToContinue := !GetStreamTracker().ShouldStopPlayback(userID, update)
 	progress.AllowedToContinue = &allowedToContinue
 	// Bind the release's required bitrate to the exact active source. Provider
@@ -844,6 +848,19 @@ func parseTVDBIDVar(r *http.Request) int64 {
 		return 0
 	}
 	return id
+}
+
+// profileAccountID returns the account owning the profile, falling back to the
+// authenticated account when the user service cannot resolve profiles.
+func (h *HistoryHandler) profileAccountID(r *http.Request, userID string) string {
+	if resolver, ok := h.Users.(interface {
+		Get(id string) (models.User, bool)
+	}); ok {
+		if user, found := resolver.Get(userID); found && user.AccountID != "" {
+			return user.AccountID
+		}
+	}
+	return auth.GetAccountID(r)
 }
 
 func (h *HistoryHandler) requireUser(w http.ResponseWriter, r *http.Request) (string, bool) {

@@ -23,9 +23,12 @@ type StreamTracker struct {
 	recentlyEnded    map[string]recentlyEndedStream
 	stopPlaybacks    map[string]time.Time
 	migrationSignals map[string]playbackMigrationSignal
-	mu               sync.RWMutex
-	counter          uint64
-	playbackObserver PlaybackActivityObserver
+	// Direct-link playbacks bypass the backend transport; see direct_link_playback.go.
+	directLinkGrants    map[string]directLinkGrant
+	directLinkPlaybacks map[string]*DirectLinkPlayback
+	mu                  sync.RWMutex
+	counter             uint64
+	playbackObserver    PlaybackActivityObserver
 }
 
 type recentlyEndedStream struct {
@@ -1150,31 +1153,43 @@ func (t *StreamTracker) Count() int {
 func (t *StreamTracker) CountPlaybackSlots() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return countPlaybackSlotsLocked(t.streams, nil)
+	return t.countSlotsLocked(nil, nil)
 }
 
 // CountForAccount returns the number of active streams for the given account.
 func (t *StreamTracker) CountForAccount(accountID string) int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return countPlaybackSlotsLocked(t.streams, func(s *TrackedStream) bool {
-		return s.AccountID == accountID
-	})
+	stream, direct := accountSlotFilters(accountID)
+	return t.countSlotsLocked(stream, direct)
 }
 
 // CountForProfile returns the number of active streams for the given profile.
 func (t *StreamTracker) CountForProfile(profileID string) int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return countPlaybackSlotsLocked(t.streams, func(s *TrackedStream) bool {
-		return s.ProfileID == profileID
-	})
+	stream, direct := profileSlotFilters(profileID)
+	return t.countSlotsLocked(stream, direct)
 }
 
-func countPlaybackSlotsLocked(streams map[string]*TrackedStream, include func(*TrackedStream) bool) int {
+func accountSlotFilters(accountID string) (func(*TrackedStream) bool, func(*DirectLinkPlayback) bool) {
+	return func(s *TrackedStream) bool { return s.AccountID == accountID },
+		func(d *DirectLinkPlayback) bool { return d.AccountID == accountID }
+}
+
+func profileSlotFilters(profileID string) (func(*TrackedStream) bool, func(*DirectLinkPlayback) bool) {
+	return func(s *TrackedStream) bool { return s.ProfileID == profileID },
+		func(d *DirectLinkPlayback) bool { return d.ProfileID == profileID }
+}
+
+// countSlotsLocked counts distinct playback slots across backend-served
+// transport streams and direct-link playbacks. Direct-link playbacks already
+// represented by a tracked stream are excluded, and both kinds share one slot
+// key space, so a playback is never counted twice.
+func (t *StreamTracker) countSlotsLocked(includeStream func(*TrackedStream) bool, includeDirect func(*DirectLinkPlayback) bool) int {
 	seen := make(map[string]struct{})
-	for _, s := range streams {
-		if include != nil && !include(s) {
+	for _, s := range t.streams {
+		if includeStream != nil && !includeStream(s) {
 			continue
 		}
 		key := trackedStreamSlotKey(s)
@@ -1183,18 +1198,38 @@ func countPlaybackSlotsLocked(streams map[string]*TrackedStream, include func(*T
 		}
 		seen[key] = struct{}{}
 	}
+	for _, d := range t.activeDirectLinksLocked(includeDirect) {
+		seen[d.SlotKey] = struct{}{}
+	}
 	return len(seen)
 }
 
-func (t *StreamTracker) hasPlaybackSlotLocked(include func(*TrackedStream) bool, slotKey string) bool {
+// hasPlaybackSlotLocked reports whether the request belongs to a playback that
+// already holds a slot, so re-requests (range reads, re-resolved direct URLs,
+// fallback from a direct link to the proxy) are not rejected at the limit.
+func (t *StreamTracker) hasPlaybackSlotLocked(includeStream func(*TrackedStream) bool, includeDirect func(*DirectLinkPlayback) bool, slotKey, path string) bool {
 	if slotKey == "" {
 		return false
 	}
 	for _, s := range t.streams {
-		if include != nil && !include(s) {
+		if includeStream != nil && !includeStream(s) {
 			continue
 		}
 		if trackedStreamSlotKey(s) == slotKey {
+			return true
+		}
+	}
+	pathKey := normalizeStreamFailurePath(path)
+	for _, d := range t.activeDirectLinksLocked(includeDirect) {
+		if d.SlotKey == slotKey {
+			return true
+		}
+		// Clients resolving a direct URL often omit profile/media query
+		// parameters, so their request slot key falls back to client IP + path.
+		// Match the same source from the same profile or device instead.
+		if pathKey != "" && normalizeStreamFailurePath(d.Path) == pathKey &&
+			(strings.HasPrefix(slotKey, strings.ToLower(d.ProfileID)+"|") ||
+				strings.HasPrefix(slotKey, "ip:"+strings.ToLower(strings.TrimSpace(d.ClientIP))+"|")) {
 			return true
 		}
 	}
@@ -1211,7 +1246,7 @@ func (t *StreamTracker) WouldExceedGlobalLimit(r *http.Request, path string, max
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	current := countPlaybackSlotsLocked(t.streams, nil)
+	current := t.countSlotsLocked(nil, nil)
 	available := maxStreams - current
 	if available < 0 {
 		available = 0
@@ -1225,7 +1260,7 @@ func (t *StreamTracker) WouldExceedGlobalLimit(r *http.Request, path string, max
 	if current < maxStreams {
 		return usage, false
 	}
-	return usage, !t.hasPlaybackSlotLocked(nil, requestStreamSlotKey(r, path))
+	return usage, !t.hasPlaybackSlotLocked(nil, nil, requestStreamSlotKey(r, path), path)
 }
 
 // WouldExceedAccountLimit reports whether starting this request would create a
@@ -1238,8 +1273,8 @@ func (t *StreamTracker) WouldExceedAccountLimit(r *http.Request, path, accountID
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	include := func(s *TrackedStream) bool { return s.AccountID == accountID }
-	current := countPlaybackSlotsLocked(t.streams, include)
+	include, includeDirect := accountSlotFilters(accountID)
+	current := t.countSlotsLocked(include, includeDirect)
 	available := maxStreams - current
 	if available < 0 {
 		available = 0
@@ -1253,7 +1288,7 @@ func (t *StreamTracker) WouldExceedAccountLimit(r *http.Request, path, accountID
 	if current < maxStreams {
 		return usage, false
 	}
-	return usage, !t.hasPlaybackSlotLocked(include, requestStreamSlotKey(r, path))
+	return usage, !t.hasPlaybackSlotLocked(include, includeDirect, requestStreamSlotKey(r, path), path)
 }
 
 // WouldExceedProfileLimit reports whether starting this request would create a
@@ -1266,8 +1301,8 @@ func (t *StreamTracker) WouldExceedProfileLimit(r *http.Request, path, profileID
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	include := func(s *TrackedStream) bool { return s.ProfileID == profileID }
-	current := countPlaybackSlotsLocked(t.streams, include)
+	include, includeDirect := profileSlotFilters(profileID)
+	current := t.countSlotsLocked(include, includeDirect)
 	available := maxStreams - current
 	if available < 0 {
 		available = 0
@@ -1281,7 +1316,7 @@ func (t *StreamTracker) WouldExceedProfileLimit(r *http.Request, path, profileID
 	if current < maxStreams {
 		return usage, false
 	}
-	return usage, !t.hasPlaybackSlotLocked(include, requestStreamSlotKey(r, path))
+	return usage, !t.hasPlaybackSlotLocked(include, includeDirect, requestStreamSlotKey(r, path), path)
 }
 
 // GetAccountStreamUsage returns a usage summary for the given account.

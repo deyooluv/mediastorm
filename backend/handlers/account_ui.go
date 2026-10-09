@@ -339,6 +339,32 @@ func (h *AccountUIHandler) GetStreams(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Direct-link playbacks stream from the provider and carry no transport data.
+	for _, playback := range dashboardDirectLinkPlaybacks(h.hlsManager) {
+		if !profileIDs[playback.ProfileID] {
+			continue
+		}
+		profileName := ""
+		for _, p := range profiles {
+			if p.ID == playback.ProfileID {
+				profileName = p.Name
+				break
+			}
+		}
+		streams = append(streams, map[string]interface{}{
+			"id":             playback.ID,
+			"type":           directLinkStreamType,
+			"path":           playback.Path,
+			"filename":       playback.Filename,
+			"profile_id":     playback.ProfileID,
+			"profile_name":   profileName,
+			"client_ip":      playback.ClientIP,
+			"created_at":     playback.StartTime,
+			"last_access":    playback.LastHeartbeat,
+			"bytes_streamed": int64(0),
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"streams": streams,

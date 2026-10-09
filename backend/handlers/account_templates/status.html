@@ -187,7 +187,7 @@ async function refreshStreams() {
         container.innerHTML = streams.map(stream => {
             const duration = formatDuration(stream.created_at);
             const bytes = formatBytes(stream.bytes_streamed || 0);
-            const type = stream.type === 'hls' ? 'HLS' : 'Direct';
+            const type = stream.type === 'hls' ? 'HLS' : (stream.type === 'direct_link' ? 'Direct link' : 'Direct');
             const badges = [];
 
             if (stream.has_dv) badges.push('<span class="status-badge online">Dolby Vision</span>');
