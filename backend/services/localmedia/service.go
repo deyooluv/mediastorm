@@ -65,8 +65,9 @@ type Service struct {
 }
 
 type scanMetadataCache struct {
-	mu      sync.Mutex
-	details map[string]*models.Title
+	mu            sync.Mutex
+	details       map[string]*models.Title
+	byExternalIDs map[string]localMediaMatch
 }
 
 const parseBatchSize = 200
@@ -1747,6 +1748,7 @@ func (s *Service) buildItem(ctx context.Context, library models.LocalMediaLibrar
 	modifiedAt := info.ModTime().UTC()
 	now := time.Now().UTC()
 	if hasExisting && canReuseLocalMediaItem(existing, filePath, info.Size(), modifiedAt) {
+		s.rematchReusedItemByExternalIDs(ctx, library, detected, metadataCache, &existing)
 		existing.FilePath = filePath
 		existing.FileName = filepath.Base(filePath)
 		existing.IsMissing = false
@@ -1798,6 +1800,27 @@ func (s *Service) buildItem(ctx context.Context, library models.LocalMediaLibrar
 	}
 	item.ModifiedAt = &modifiedAt
 	return item, false, nil
+}
+
+// rematchReusedItemByExternalIDs moves an unchanged file to the title named by
+// its ID tags when an earlier scan matched it by title search instead (for
+// example before folder tags were read). Manual matches are never touched.
+func (s *Service) rematchReusedItemByExternalIDs(ctx context.Context, library models.LocalMediaLibrary, detected detectedTitle, metadataCache *scanMetadataCache, item *models.LocalMediaItem) {
+	if s.metadata == nil || library.Type == models.LocalMediaLibraryTypeOther || item.MatchStatus == models.LocalMediaMatchStatusManual {
+		return
+	}
+	match := s.matchMetadataByExternalIDs(ctx, library.Type, detected, metadataCache)
+	if match.status == "" || match.titleID == "" || match.titleID == item.MatchedTitleID {
+		return
+	}
+	log.Printf("[localmedia] rematched by external ids file=%q from=%q to=%q", item.RelativePath, item.MatchedTitleID, match.titleID)
+	item.Confidence = match.confidence
+	item.MatchStatus = match.status
+	item.MatchedTitleID = match.titleID
+	item.MatchedMediaType = match.mediaType
+	item.MatchedName = match.name
+	item.MatchedYear = match.year
+	item.Metadata = match.metadata
 }
 
 func canReuseLocalMediaItem(existing models.LocalMediaItem, filePath string, size int64, modifiedAt time.Time) bool {
@@ -1884,7 +1907,9 @@ func (s *Service) detectTitlesForFiles(filePaths []string, libraryType models.Lo
 	for _, filePath := range filePaths {
 		fileName := filepath.Base(filePath)
 		parsed := parsedByName[fileName]
-		results[filePath] = detectTitle(libraryType, fileName, parsed)
+		detected := detectTitle(libraryType, fileName, parsed)
+		applyFolderExternalIDs(&detected, filePath)
+		results[filePath] = detected
 	}
 
 	return results
@@ -1959,6 +1984,37 @@ func (s *Service) matchMetadataByExternalIDs(ctx context.Context, libraryType mo
 	if strings.TrimSpace(detected.imdbID) == "" && detected.tmdbID == 0 && detected.tvdbID == 0 {
 		return localMediaMatch{}
 	}
+	cacheKey := fmt.Sprintf("%s|%s|%d|%d", libraryType, strings.TrimSpace(detected.imdbID), detected.tmdbID, detected.tvdbID)
+	if metadataCache != nil {
+		metadataCache.mu.Lock()
+		cached, ok := metadataCache.byExternalIDs[cacheKey]
+		metadataCache.mu.Unlock()
+		if ok {
+			if cached.metadata != nil {
+				copy := *cached.metadata
+				cached.metadata = &copy
+			}
+			return cached
+		}
+	}
+	match := s.resolveMetadataByExternalIDs(ctx, libraryType, detected, metadataCache)
+	if metadataCache != nil {
+		stored := match
+		if stored.metadata != nil {
+			copy := *stored.metadata
+			stored.metadata = &copy
+		}
+		metadataCache.mu.Lock()
+		if metadataCache.byExternalIDs == nil {
+			metadataCache.byExternalIDs = make(map[string]localMediaMatch)
+		}
+		metadataCache.byExternalIDs[cacheKey] = stored
+		metadataCache.mu.Unlock()
+	}
+	return match
+}
+
+func (s *Service) resolveMetadataByExternalIDs(ctx context.Context, libraryType models.LocalMediaLibraryType, detected detectedTitle, metadataCache *scanMetadataCache) localMediaMatch {
 
 	var title *models.Title
 	switch libraryType {
@@ -2270,6 +2326,32 @@ func extractExternalIDs(value string) (string, int64, int64) {
 	}
 
 	return imdbID, tmdbID, tvdbID
+}
+
+// folderExternalIDDepth covers "Show {tvdb-1}/Season 1/file" and
+// "Movie {tmdb-1}/file" layouts without reading tags from library roots.
+const folderExternalIDDepth = 2
+
+// applyFolderExternalIDs fills IDs from Sonarr/Radarr/Plex-style folder tags
+// when the file name carries none. File name IDs win and are never mixed with
+// folder IDs.
+func applyFolderExternalIDs(detected *detectedTitle, filePath string) {
+	if detected.imdbID != "" || detected.tmdbID != 0 || detected.tvdbID != 0 {
+		return
+	}
+	dir := filepath.Dir(filePath)
+	for depth := 0; depth < folderExternalIDDepth; depth++ {
+		name := filepath.Base(dir)
+		if name == "" || name == "." || name == string(filepath.Separator) {
+			return
+		}
+		imdbID, tmdbID, tvdbID := extractExternalIDs(name)
+		if imdbID != "" || tmdbID != 0 || tvdbID != 0 {
+			detected.imdbID, detected.tmdbID, detected.tvdbID = imdbID, tmdbID, tvdbID
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 func collectVideoFiles(root string) ([]scanFileCandidate, error) {

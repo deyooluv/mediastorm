@@ -2918,7 +2918,7 @@ func enrichEpisodeFromMetadata(ref *models.EpisodeReference, details *models.Ser
 		return
 	}
 	if ref.EpisodeNumber > 0 {
-		if ep, ok := findEpisodeByAbsoluteNumber(details, ref.EpisodeNumber); ok {
+		if ep, ok := findEpisodeByAbsoluteNumber(details, ref.EpisodeNumber); ok && legacyAbsoluteRemapAllowed(ref.SeasonNumber, ep.SeasonNumber) {
 			log.Printf("[history] normalized legacy absolute episode S%02dE%02d to S%02dE%02d (abs: %d)",
 				ref.SeasonNumber, ref.EpisodeNumber, ep.SeasonNumber, ep.EpisodeNumber, ep.AbsoluteEpisodeNumber)
 			applyEpisodeMetadata(ref, ep)
@@ -2964,10 +2964,18 @@ func (idx *episodeNumberingIndex) canonical(season, episode int) (int, int) {
 	if _, ok := idx.valid[episodeKey(season, episode)]; ok {
 		return season, episode
 	}
-	if mapped, ok := idx.absolute[episode]; ok {
+	if mapped, ok := idx.absolute[episode]; ok && legacyAbsoluteRemapAllowed(season, mapped[0]) {
 		return mapped[0], mapped[1]
 	}
 	return season, episode
+}
+
+// legacyAbsoluteRemapAllowed rejects reading a season-relative episode number
+// as an absolute number when that would move it to an earlier season. Absolute
+// numbers only grow across seasons, so a legacy S23E1163 maps forward or within
+// S23; an S17E03 missing from stale or truncated metadata is not absolute #3.
+func legacyAbsoluteRemapAllowed(season, mappedSeason int) bool {
+	return season <= 0 || mappedSeason >= season
 }
 
 func findEpisodeByAbsoluteNumber(details *models.SeriesDetails, absoluteEpisodeNumber int) (models.SeriesEpisode, bool) {
