@@ -130,6 +130,9 @@ func ReleaseEpisodeAliases(titleID string, season, episode int, numbering ...*mo
 	if m, ok := KnownAnthologyEpisode(titleID, season, episode); ok {
 		out = append(out, m)
 	}
+	if m, ok := seasonOffsetAlias(seriesSeasonOffsets, titleID, season, episode); ok {
+		out = append(out, m)
+	}
 	s := episodeMappings.Load()
 	if s == nil || season < 1 || episode < 1 {
 		return out

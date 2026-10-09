@@ -16,9 +16,15 @@ Sources:
   absolute numbers. TMDB catalogs require an Anime-Lists bridge first; a
   show-level TVDB ID alone does not prove equal episode numbering. Native TVDB
   catalog identities can use XEM directly, including non-anime series.
+- Manual season offsets (`season_offsets.go`): TMDB entries that restart at
+  S1 after a channel move or revival (Channel 4 Bake Off, Netflix Top Boy,
+  MST3K) alias to the continuous TVDB/IMDb seasons. They add release queries
+  only while TMDB numbers the episodes and never change scrobble identity.
+  Split seasons (Unsolved Mysteries 2020 S3 = TVDB S17+S18) and spin-offs whose
+  IMDb and TVDB numbering disagree (An Extra Slice) are deliberately absent.
 
-There is no guessed cour length or title-specific exception. Conflicting,
-non-bijective (split/combined), unmapped, and special-to-regular relationships
+Beyond those reviewed offsets there is no guessed cour length or title-specific
+exception. Conflicting, non-bijective (split/combined), unmapped, and special-to-regular relationships
 are not accepted as interchangeable whole episodes. Absolute `a` defaults
 require explicit range mappings; they are not interpreted as a season number.
 Same-season ambiguous packs keep the catalog behavior rather than guessing.
