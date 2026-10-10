@@ -3,226 +3,175 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"net/url"
-	"regexp"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
+
+	"novastream/services/skipsegments"
 )
 
-var introDBSegmentsURL = "https://api.introdb.app/segments"
-var skipDBSegmentsURL = "https://api.skipdb.tv/api/segments"
+// skipSegmentService is shared so upstream IntroDB/SkipDB lookups are cached
+// across clients. Tests replace it with one pointed at httptest fakes.
+var skipSegmentService = skipsegments.New(skipsegments.Options{})
 
-var introDBIMDbPattern = regexp.MustCompile(`^tt[0-9]+$`)
+const (
+	// Overall budget for one request; each provider also has its own shorter timeout.
+	skipSegmentRequestTimeout = 8 * time.Second
+	maxSkipSegmentChapters    = 500
+	maxSkipSegmentBodyBytes   = 256 * 1024
+	maxSkipSegmentTitleLength = 200
+)
 
-type introDBSegment struct {
-	StartMS         *int64  `json:"start_ms"`
-	EndMS           *int64  `json:"end_ms"`
-	Confidence      float64 `json:"confidence"`
-	SubmissionCount int     `json:"submission_count"`
-	Source          string  `json:"source,omitempty"`
+type legacySegment struct {
+	StartMS         *float64 `json:"start_ms"`
+	EndMS           *float64 `json:"end_ms"`
+	Confidence      float64  `json:"confidence,omitempty"`
+	SubmissionCount int      `json:"submission_count,omitempty"`
+	Source          string   `json:"source,omitempty"`
 }
 
-type skipDBSegmentsResponse struct {
-	Segments struct {
-		Intro *skipDBSegment `json:"intro"`
-		Recap *skipDBSegment `json:"recap"`
-		Outro *skipDBSegment `json:"outro"`
-	} `json:"segments"`
-}
-
-type skipDBSegment struct {
-	StartMS *int64 `json:"start_ms"`
-	EndMS   *int64 `json:"end_ms"`
-	Match   string `json:"match"`
-}
-
+// introDBSegmentsResponse is the GET /video/segments payload. The intro/recap/outro
+// fields are the original IntroDB-then-SkipDB shape used by the web player;
+// Segments is the additive, normalized merge (no chapters on GET).
 type introDBSegmentsResponse struct {
-	IMDbID  string          `json:"imdb_id,omitempty"`
-	Season  int             `json:"season,omitempty"`
-	Episode int             `json:"episode,omitempty"`
-	Intro   *introDBSegment `json:"intro"`
-	Recap   *introDBSegment `json:"recap"`
-	Outro   *introDBSegment `json:"outro"`
+	IMDbID   string                 `json:"imdb_id,omitempty"`
+	Season   int                    `json:"season,omitempty"`
+	Episode  int                    `json:"episode,omitempty"`
+	Intro    *legacySegment         `json:"intro"`
+	Recap    *legacySegment         `json:"recap"`
+	Outro    *legacySegment         `json:"outro"`
+	Segments []skipsegments.Segment `json:"segments"`
 }
 
-type cachedIntroDBSegments struct {
-	response  introDBSegmentsResponse
-	expiresAt time.Time
+// resolveSkipSegmentsRequest is the POST /video/segments body. All fields are
+// optional: providers are queried only for a valid imdbId+season+episode, and
+// chapter names are always merged as the lowest-priority source.
+type resolveSkipSegmentsRequest struct {
+	IMDbID   string                 `json:"imdbId"`
+	Season   int                    `json:"season"`
+	Episode  int                    `json:"episode"`
+	Duration float64                `json:"duration"`
+	Chapters []skipsegments.Chapter `json:"chapters"`
 }
 
-var webIntroDBCache = struct {
-	sync.RWMutex
-	entries map[string]cachedIntroDBSegments
-}{entries: make(map[string]cachedIntroDBSegments)}
+type resolveSkipSegmentsResponse struct {
+	Segments []skipsegments.Segment `json:"segments"`
+}
 
-var webIntroDBHTTPClient = &http.Client{Timeout: 6 * time.Second}
-
-// GetIntroSegments resolves IntroDB, then SkipDB, for the standalone web player.
-// The web client uses this same-origin bridge because IntroDB restricts browser origins.
+// GetIntroSegments serves /video/segments.
+//   - GET  (imdbId, season, episode, duration query params): IntroDB, then SkipDB.
+//     Kept for the web player and older clients.
+//   - POST (JSON body with optional chapters): full IntroDB → SkipDB → chapter merge.
 func (h *VideoHandler) GetIntroSegments(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
+	switch r.Method {
+	case http.MethodOptions:
 		h.HandleOptions(w, r)
-		return
-	}
-	if r.Method != http.MethodGet {
+	case http.MethodGet:
+		h.getLegacyIntroSegments(w, r)
+	case http.MethodPost:
+		h.resolveSkipSegments(w, r)
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
 
-	imdbID := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("imdbId")))
+func (h *VideoHandler) getLegacyIntroSegments(w http.ResponseWriter, r *http.Request) {
 	season, seasonErr := strconv.Atoi(r.URL.Query().Get("season"))
 	episode, episodeErr := strconv.Atoi(r.URL.Query().Get("episode"))
-	if !introDBIMDbPattern.MatchString(imdbID) || seasonErr != nil || episodeErr != nil || season <= 0 || episode <= 0 {
+	key, keyErr := skipsegments.NormalizeEpisodeKey(r.URL.Query().Get("imdbId"), season, episode)
+	if keyErr != nil || seasonErr != nil || episodeErr != nil {
 		http.Error(w, "valid imdbId, season, and episode are required", http.StatusBadRequest)
 		return
 	}
 	duration, _ := strconv.ParseFloat(r.URL.Query().Get("duration"), 64)
-	if math.IsNaN(duration) || math.IsInf(duration, 0) || duration < 0 {
-		duration = 0
-	}
-	duration = math.Round(duration)
+	duration = math.Round(skipsegments.SanitizeDuration(duration))
 
-	cacheKey := fmt.Sprintf("%s:%d:%d:%.0f", imdbID, season, episode, duration)
-	if cached, ok := getCachedIntroDBSegments(cacheKey); ok {
-		writeIntroDBSegments(w, cached)
+	ctx, cancel := context.WithTimeout(r.Context(), skipSegmentRequestTimeout)
+	defer cancel()
+	lookup := skipSegmentService.Lookup(ctx, key, duration)
+	if lookup.IntroDBErr != nil && lookup.SkipDBErr != nil {
+		http.Error(w, "intro segments unavailable", http.StatusBadGateway)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
-	defer cancel()
-	result, introErr := fetchIntroDBSegments(ctx, imdbID, season, episode)
-	result.IMDbID = imdbID
-	result.Season = season
-	result.Episode = episode
-	result.Intro = validIntroDBSegment(result.Intro, duration)
-	result.Recap = validIntroDBSegment(result.Recap, duration)
-	result.Outro = validIntroDBSegment(result.Outro, duration)
-	if result.Intro == nil || result.Recap == nil || result.Outro == nil {
-		skip, skipErr := fetchSkipDBSegments(ctx, imdbID, season, episode, duration)
-		if introErr != nil && skipErr != nil {
-			http.Error(w, "intro segments unavailable", http.StatusBadGateway)
+	result := introDBSegmentsResponse{IMDbID: key.IMDbID, Season: key.Season, Episode: key.Episode}
+	if lookup.IntroDB != nil {
+		result.Intro = legacyProviderSegment(lookup.IntroDB.Intro, "", duration)
+		result.Recap = legacyProviderSegment(lookup.IntroDB.Recap, "", duration)
+		result.Outro = legacyProviderSegment(lookup.IntroDB.Outro, "", duration)
+	}
+	if lookup.SkipDB != nil {
+		if result.Intro == nil {
+			result.Intro = legacyProviderSegment(lookup.SkipDB.Segments.Intro, skipsegments.SourceSkipDB, duration)
+		}
+		if result.Recap == nil {
+			result.Recap = legacyProviderSegment(lookup.SkipDB.Segments.Recap, skipsegments.SourceSkipDB, duration)
+		}
+		if result.Outro == nil {
+			result.Outro = legacyProviderSegment(lookup.SkipDB.Segments.Outro, skipsegments.SourceSkipDB, duration)
+		}
+	}
+	result.Segments = skipsegments.Resolve(lookup.IntroDB, lookup.SkipDB, nil, duration)
+	writeSkipSegmentsJSON(w, result)
+}
+
+// legacyProviderSegment applies the shared validation in the millisecond legacy
+// shape. IntroDB entries keep their metadata and carry no source tag.
+func legacyProviderSegment(segment *skipsegments.ProviderSegment, source string, duration float64) *legacySegment {
+	validateAs := source
+	if validateAs == "" {
+		validateAs = skipsegments.SourceIntroDB
+	}
+	startMS, endMS, ok := skipsegments.ValidProviderRange(validateAs, segment, duration)
+	if !ok {
+		return nil
+	}
+	legacy := &legacySegment{StartMS: &startMS, EndMS: &endMS, Source: source}
+	if source == "" {
+		legacy.Confidence = segment.Confidence
+		legacy.SubmissionCount = segment.SubmissionCount
+	}
+	return legacy
+}
+
+func (h *VideoHandler) resolveSkipSegments(w http.ResponseWriter, r *http.Request) {
+	var request resolveSkipSegmentsRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxSkipSegmentBodyBytes+1))
+	if err != nil || len(body) > maxSkipSegmentBodyBytes {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &request); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if skipErr == nil {
-			if result.Intro == nil {
-				result.Intro = validSkipDBSegment(skip.Segments.Intro, duration)
-			}
-			if result.Recap == nil {
-				result.Recap = validSkipDBSegment(skip.Segments.Recap, duration)
-			}
-			if result.Outro == nil {
-				result.Outro = validSkipDBSegment(skip.Segments.Outro, duration)
-			}
+	}
+	if len(request.Chapters) > maxSkipSegmentChapters {
+		request.Chapters = request.Chapters[:maxSkipSegmentChapters]
+	}
+	for index := range request.Chapters {
+		if title := []rune(request.Chapters[index].Title); len(title) > maxSkipSegmentTitleLength {
+			request.Chapters[index].Title = string(title[:maxSkipSegmentTitleLength])
 		}
 	}
-	ttl := 30 * time.Minute
-	if result.Intro != nil || result.Recap != nil || result.Outro != nil {
-		ttl = 6 * time.Hour
+	duration := skipsegments.SanitizeDuration(request.Duration)
+
+	var lookup skipsegments.LookupResult
+	if key, err := skipsegments.NormalizeEpisodeKey(request.IMDbID, request.Season, request.Episode); err == nil {
+		ctx, cancel := context.WithTimeout(r.Context(), skipSegmentRequestTimeout)
+		lookup = skipSegmentService.Lookup(ctx, key, duration)
+		cancel()
 	}
-	cacheIntroDBSegments(cacheKey, result, ttl)
-	writeIntroDBSegments(w, result)
+	// Provider failures degrade to chapter-only results; this endpoint never fails playback.
+	writeSkipSegmentsJSON(w, resolveSkipSegmentsResponse{
+		Segments: skipsegments.Resolve(lookup.IntroDB, lookup.SkipDB, request.Chapters, duration),
+	})
 }
 
-func fetchIntroDBSegments(ctx context.Context, imdbID string, season, episode int) (introDBSegmentsResponse, error) {
-	query := url.Values{"imdb_id": {imdbID}, "season": {strconv.Itoa(season)}, "episode": {strconv.Itoa(episode)}}
-	var result introDBSegmentsResponse
-	err := fetchSegmentJSON(ctx, introDBSegmentsURL+"?"+query.Encode(), &result)
-	return result, err
-}
-
-func fetchSkipDBSegments(ctx context.Context, imdbID string, season, episode int, duration float64) (skipDBSegmentsResponse, error) {
-	query := url.Values{"imdb_id": {imdbID}, "season": {strconv.Itoa(season)}, "episode": {strconv.Itoa(episode)}}
-	if duration > 0 {
-		query.Set("duration", strconv.FormatFloat(duration, 'f', 0, 64))
-	}
-	var result skipDBSegmentsResponse
-	err := fetchSegmentJSON(ctx, skipDBSegmentsURL+"?"+query.Encode(), &result)
-	return result, err
-}
-
-func fetchSegmentJSON(ctx context.Context, endpoint string, destination any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "MediaStorm-WebPlayer/1.0")
-	resp, err := webIntroDBHTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("segment provider returned %d", resp.StatusCode)
-	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 128*1024)).Decode(destination)
-}
-
-func validSkipDBSegment(segment *skipDBSegment, duration float64) *introDBSegment {
-	if segment == nil || segment.Match == "out-of-range" || segment.StartMS == nil || segment.EndMS == nil || *segment.StartMS < 0 || *segment.EndMS <= *segment.StartMS {
-		return nil
-	}
-	end := *segment.EndMS
-	if duration > 0 {
-		durationMS := int64(duration * 1000)
-		if *segment.StartMS >= durationMS {
-			return nil
-		}
-		if end > durationMS {
-			end = durationMS
-		}
-	}
-	return &introDBSegment{StartMS: segment.StartMS, EndMS: &end, Source: "skipdb"}
-}
-
-func validIntroDBSegment(segment *introDBSegment, duration float64) *introDBSegment {
-	if segment == nil || segment.StartMS == nil || segment.EndMS == nil || *segment.StartMS < 0 || *segment.EndMS <= *segment.StartMS {
-		return nil
-	}
-	if duration > 0 {
-		durationMS := int64(duration * 1000)
-		if *segment.StartMS >= durationMS {
-			return nil
-		}
-		if *segment.EndMS > durationMS {
-			end := durationMS
-			segment.EndMS = &end
-		}
-	}
-	return segment
-}
-
-func getCachedIntroDBSegments(key string) (introDBSegmentsResponse, bool) {
-	webIntroDBCache.RLock()
-	entry, ok := webIntroDBCache.entries[key]
-	webIntroDBCache.RUnlock()
-	if !ok || time.Now().After(entry.expiresAt) {
-		if ok {
-			webIntroDBCache.Lock()
-			delete(webIntroDBCache.entries, key)
-			webIntroDBCache.Unlock()
-		}
-		return introDBSegmentsResponse{}, false
-	}
-	return entry.response, true
-}
-
-func cacheIntroDBSegments(key string, response introDBSegmentsResponse, ttl time.Duration) {
-	webIntroDBCache.Lock()
-	webIntroDBCache.entries[key] = cachedIntroDBSegments{response: response, expiresAt: time.Now().Add(ttl)}
-	webIntroDBCache.Unlock()
-}
-
-func writeIntroDBSegments(w http.ResponseWriter, response introDBSegmentsResponse) {
+func writeSkipSegmentsJSON(w http.ResponseWriter, response any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, max-age=300")
 	_ = json.NewEncoder(w).Encode(response)
