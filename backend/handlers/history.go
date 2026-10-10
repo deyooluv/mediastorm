@@ -109,8 +109,24 @@ func (h *HistoryHandler) ListContinueWatching(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	items = h.withProgressMerged(userID, items)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(h.withPrequeueStatus(userID, items))
+}
+
+// withProgressMerged folds the user's playback progress into continue-watching
+// items so each carries server-computed percentWatched/resumePercent, a
+// `resume` state, and canonical episode item IDs. On a progress lookup failure
+// the items are returned unchanged.
+func (h *HistoryHandler) withProgressMerged(userID string, items []models.SeriesWatchState) []models.SeriesWatchState {
+	if len(items) == 0 {
+		return items
+	}
+	progress, err := h.Service.ListPlaybackProgress(userID)
+	if err != nil {
+		return items
+	}
+	return history.MergeProgressIntoContinueWatching(items, progress)
 }
 
 func (h *HistoryHandler) withPrequeueStatus(userID string, items []models.SeriesWatchState) []models.SeriesWatchState {
@@ -193,6 +209,13 @@ func (h *HistoryHandler) GetSeriesWatchState(w http.ResponseWriter, r *http.Requ
 	if state == nil {
 		http.Error(w, "series watch state not found", http.StatusNotFound)
 		return
+	}
+	// Only series with an up-next episode get resume data; a series state with
+	// no next episode would otherwise be merged with movie semantics.
+	if state.NextEpisode != nil {
+		if merged := h.withProgressMerged(userID, []models.SeriesWatchState{*state}); len(merged) == 1 {
+			state = &merged[0]
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -487,8 +510,11 @@ func (h *HistoryHandler) UpdateWatchHistory(w http.ResponseWriter, r *http.Reque
 		update.ItemID = itemID
 	}
 
+	if update.ItemID == "" {
+		update.ItemID = episodeItemIDFromParts(update.MediaType, update.SeriesID, update.ExternalIDs, update.SeasonNumber, update.EpisodeNumber)
+	}
 	if update.MediaType == "" || update.ItemID == "" {
-		http.Error(w, "mediaType and itemID are required", http.StatusBadRequest)
+		http.Error(w, "mediaType and itemID (or seriesId + seasonNumber + episodeNumber for episodes) are required", http.StatusBadRequest)
 		return
 	}
 
@@ -603,8 +629,11 @@ func (h *HistoryHandler) UpdatePlaybackProgress(w http.ResponseWriter, r *http.R
 		update.ItemID = itemID
 	}
 
+	if update.ItemID == "" {
+		update.ItemID = episodeItemIDFromParts(update.MediaType, update.SeriesID, update.ExternalIDs, update.SeasonNumber, update.EpisodeNumber)
+	}
 	if update.MediaType == "" || update.ItemID == "" {
-		http.Error(w, "mediaType and itemID are required", http.StatusBadRequest)
+		http.Error(w, "mediaType and itemID (or seriesId + seasonNumber + episodeNumber for episodes) are required", http.StatusBadRequest)
 		return
 	}
 
@@ -644,9 +673,24 @@ func (h *HistoryHandler) UpdatePlaybackProgress(w http.ResponseWriter, r *http.R
 		progress.MigrationPreparationRequested = true
 		progress.MigrationPreparationReason = reason
 	}
+	progress.Resume = history.ProgressResume(progress)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(progress)
+}
+
+// episodeItemIDFromParts builds the canonical episode item ID server-side when
+// a write identifies an episode by seriesId + seasonNumber + episodeNumber
+// instead of an explicit itemId. Returns "" for non-episodes or when the parts
+// are insufficient, leaving the existing required-field validation in charge.
+func episodeItemIDFromParts(mediaType, seriesID string, externalIDs map[string]string, seasonNumber, episodeNumber int) string {
+	if mediaidentity.NormalizeMediaType(mediaType) != "episode" {
+		return ""
+	}
+	if strings.TrimSpace(seriesID) == "" {
+		return ""
+	}
+	return history.EpisodeItemID(seriesID, externalIDs, seasonNumber, episodeNumber)
 }
 
 // GetPlaybackProgress retrieves the playback progress for a specific media item
@@ -675,9 +719,11 @@ func (h *HistoryHandler) GetPlaybackProgress(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	withResume := *progress
+	withResume.Resume = history.ProgressResume(withResume)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(progress)
+	json.NewEncoder(w).Encode(withResume)
 }
 
 // ListPlaybackProgress returns all playback progress items for a user
@@ -692,9 +738,22 @@ func (h *HistoryHandler) ListPlaybackProgress(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Optional title scoping (?titleId=&type=series|movie&tmdbId=&tvdbId=&imdbId=)
+	// lets a client fetch one series' episode progress instead of every row.
+	// Older servers ignore these params and return the full list.
+	query := r.URL.Query()
+	titleID := strings.TrimSpace(query.Get("titleId"))
+	ext := titleExternalIDs{
+		imdb: strings.ToLower(strings.TrimSpace(query.Get("imdbId"))),
+		tvdb: nonZeroInt64String(trimAndParseInt64(query.Get("tvdbId"))),
+		tmdb: nonZeroInt64String(trimAndParseInt64(query.Get("tmdbId"))),
+	}
+	if titleID != "" || ext.imdb != "" || ext.tvdb != "" || ext.tmdb != "" {
+		items = filterProgressForTitle(items, titleID, strings.ToLower(strings.TrimSpace(query.Get("type"))), ext)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(items)
+	json.NewEncoder(w).Encode(history.WithProgressResume(items))
 }
 
 // deleteByBodyRequest identifies an item for the body-based delete endpoints.

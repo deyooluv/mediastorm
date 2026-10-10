@@ -18,6 +18,24 @@ type EpisodeReference struct {
 	AirTimeEstimated      bool              `json:"airTimeEstimated,omitempty"` // Date-only end-of-day cutoff, not a displayable broadcast time.
 	Image                 *Image            `json:"image,omitempty"`
 	WatchedAt             time.Time         `json:"watchedAt,omitempty"`
+	// ItemID is the server-built canonical progress/watch-history item ID for
+	// this episode (e.g. "tmdb:tv:95350:s01e01"). Response-only; clients should
+	// use it verbatim instead of assembling IDs themselves.
+	ItemID string `json:"itemId,omitempty"`
+}
+
+// ResumeState is the server-computed resume decision for one playable item.
+// Clients should use Eligible to decide whether to offer "Resume" rather than
+// applying their own thresholds.
+//
+// Units: Position and Duration are seconds; Percent is 0–100. When only a
+// percentage is known (e.g. imported from Trakt), Position and Duration are 0
+// and clients should seek to Percent of the media duration once known.
+type ResumeState struct {
+	Position float64 `json:"position"`
+	Duration float64 `json:"duration"`
+	Percent  float64 `json:"percent"`
+	Eligible bool    `json:"eligible"`
 }
 
 // SeriesWatchState tracks a user's progress for a particular series.
@@ -38,6 +56,10 @@ type SeriesWatchState struct {
 	WatchedEpisodes map[string]EpisodeReference `json:"watchedEpisodes,omitempty"`
 	PercentWatched  float64                     `json:"percentWatched,omitempty"`
 	ResumePercent   float64                     `json:"resumePercent,omitempty"`
+	// Resume is the server-computed resume state for the item this entry would
+	// play (the movie, or NextEpisode for series). Populated on Continue
+	// Watching responses and details-bundle watch state.
+	Resume *ResumeState `json:"resume,omitempty"`
 
 	// SortAt is an internal Continue Watching ordering timestamp. It allows a
 	// newly released next episode to establish a durable shelf position without
@@ -172,6 +194,10 @@ type PlaybackProgress struct {
 
 	// Hidden from continue watching (user dismissed)
 	HiddenFromContinueWatching bool `json:"hiddenFromContinueWatching,omitempty"`
+
+	// Resume is computed at response time from Position/Duration/PercentWatched
+	// using the server's resume thresholds. Not persisted.
+	Resume *ResumeState `json:"resume,omitempty"`
 
 	// Runtime playback control response fields. Not persisted.
 	AllowedToContinue             *bool  `json:"allowedToContinue,omitempty"`

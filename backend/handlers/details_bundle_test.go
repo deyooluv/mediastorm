@@ -186,6 +186,7 @@ func (m *mockMetadataServiceDetailsBundle) GetTopTen(_ context.Context, _ string
 type mockHistoryServiceDetailsBundle struct {
 	watchState       *models.SeriesWatchState
 	playbackProgress []models.PlaybackProgress
+	watchHistory     []models.WatchHistoryItem
 
 	watchStateErr       error
 	playbackProgressErr error
@@ -222,7 +223,7 @@ func (m *mockHistoryServiceDetailsBundle) ListSeriesStates(_ string) ([]models.S
 }
 func (m *mockHistoryServiceDetailsBundle) HideFromContinueWatching(_, _ string) error { return nil }
 func (m *mockHistoryServiceDetailsBundle) ListWatchHistory(_ string) ([]models.WatchHistoryItem, error) {
-	return nil, nil
+	return m.watchHistory, nil
 }
 func (m *mockHistoryServiceDetailsBundle) GetWatchHistoryItem(_, _, _ string) (*models.WatchHistoryItem, error) {
 	return nil, nil
