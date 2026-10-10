@@ -88,3 +88,23 @@ func TestDisplayListAlphabetUsesArticleNormalizedGlobalBucket(t *testing.T) {
 		t.Fatalf("unexpected alphabet buckets: %#v", buckets)
 	}
 }
+
+func TestDisplayListWatchStatusAcceptsDescriptiveAliases(t *testing.T) {
+	cases := map[string]string{
+		"":            "",
+		"all":         "all",
+		"none":        "none",
+		"Unwatched":   "none",
+		"partial":     "partial",
+		"in_progress": "partial",
+		"watching":    "partial",
+		"complete":    "complete",
+		"watched":     "complete",
+	}
+	for input, want := range cases {
+		req := httptest.NewRequest("GET", "/display-list?watchStatus="+input, nil)
+		if got := parseDisplayListQuery(req).WatchStatus; got != want {
+			t.Fatalf("watchStatus=%q: got %q want %q", input, got, want)
+		}
+	}
+}

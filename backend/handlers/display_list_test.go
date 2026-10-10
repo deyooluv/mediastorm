@@ -193,3 +193,80 @@ func TestDisplayListHomeViewFiltersBeforePagination(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayListCustomListSortsAndFiltersBeforePagination(t *testing.T) {
+	dir := t.TempDir()
+	wl, err := watchlist.NewService(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom, err := customlists.NewService(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userSvc, err := users.NewService(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := userSvc.ListAll()[0].ID
+	list, err := custom.CreateList(userID, "Mixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []models.WatchlistUpsert{
+		{ID: "m1", MediaType: "movie", Name: "Short", RuntimeMinutes: 80, Genres: []string{"Comedy"}},
+		{ID: "m2", MediaType: "movie", Name: "Epic", RuntimeMinutes: 200, Genres: []string{"Drama"}},
+		{ID: "m3", MediaType: "movie", Name: "Medium", RuntimeMinutes: 120, Genres: []string{"Drama", "Comedy"}},
+		{ID: "m4", MediaType: "movie", Name: "Long", RuntimeMinutes: 150, Genres: []string{"Drama"}},
+		{ID: "m5", MediaType: "movie", Name: "Unknown"},
+	} {
+		if _, err := custom.AddItem(userID, list.ID, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := handlers.NewDisplayListHandler(wl, custom, userSvc)
+
+	get := func(query string) (names []string, total int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/display-list?source=custom-list&listId="+list.ID+"&"+query, nil)
+		req = mux.SetURLVars(req, map[string]string{"userID": userID})
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", query, rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Items  []models.WatchlistItem `json:"items"`
+			Total  int                    `json:"total"`
+			Genres []string               `json:"genres"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Genres) != 2 {
+			t.Fatalf("%s: facets must cover the unfiltered list, got %v", query, got.Genres)
+		}
+		for _, item := range got.Items {
+			names = append(names, item.Name)
+		}
+		return names, got.Total
+	}
+
+	// Duration sort is applied to the whole list before the page is cut.
+	names, total := get("sortBy=duration&sortDirection=desc&limit=2&offset=1")
+	if total != 5 || len(names) != 2 || names[0] != "Long" || names[1] != "Medium" {
+		t.Fatalf("duration page: total=%d names=%v", total, names)
+	}
+
+	// Genre filtering narrows the total that drives pagination.
+	names, total = get("genres=drama&sortBy=duration&sortDirection=asc&limit=2&offset=0")
+	if total != 3 || len(names) != 2 || names[0] != "Medium" || names[1] != "Long" {
+		t.Fatalf("genre page: total=%d names=%v", total, names)
+	}
+
+	// Omitting the query keeps the stored (newest-first) order and full total.
+	names, total = get("")
+	if total != 5 || len(names) != 5 || names[0] != "Unknown" {
+		t.Fatalf("default order: total=%d names=%v", total, names)
+	}
+}

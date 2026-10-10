@@ -110,7 +110,7 @@ func parseDisplayListQuery(r *http.Request) displayListQueryOptions {
 	return displayListQueryOptions{
 		Title:                  strings.TrimSpace(q.Get("titleFilter")),
 		MediaType:              strings.ToLower(strings.TrimSpace(q.Get("filterMediaType"))),
-		WatchStatus:            strings.ToLower(strings.TrimSpace(q.Get("watchStatus"))),
+		WatchStatus:            normalizeDisplayListWatchStatus(q.Get("watchStatus")),
 		Genres:                 genres,
 		SortBy:                 strings.ToLower(strings.TrimSpace(q.Get("sortBy"))),
 		SortDirection:          strings.ToLower(strings.TrimSpace(q.Get("sortDirection"))),
@@ -119,6 +119,23 @@ func parseDisplayListQuery(r *http.Request) displayListQueryOptions {
 		IncludeUnwatchedCounts: strings.EqualFold(strings.TrimSpace(q.Get("includeUnwatchedCounts")), "true"),
 		Alphabet:               strings.ToUpper(strings.TrimSpace(q.Get("alphabet"))),
 	}
+}
+
+// normalizeDisplayListWatchStatus maps the watch-status filter onto the
+// canonical WatchState values (none, partial, complete). Descriptive aliases
+// are accepted so clients that do not share the frontend's vocabulary (for
+// example the native tvOS client) can use the same contract.
+func normalizeDisplayListWatchStatus(value string) string {
+	status := strings.ToLower(strings.TrimSpace(value))
+	switch status {
+	case "unwatched", "not_watched", "not-watched":
+		return "none"
+	case "in_progress", "in-progress", "inprogress", "watching", "started":
+		return "partial"
+	case "watched", "completed":
+		return "complete"
+	}
+	return status
 }
 
 func (q displayListQueryOptions) RequiresIndex() bool {
