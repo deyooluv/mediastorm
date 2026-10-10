@@ -128,6 +128,9 @@ test-subs.ass
 # Frontend (private repo: godver3/mediastorm-frontend)
 frontend/
 
+# Native tvOS client (private repo: godver3/mediastorm-tvos)
+native-tvos/
+
 # KSPlayer fork symlink (actual repo at ~/ksplayer)
 /ksplayer
 
