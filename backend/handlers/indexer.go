@@ -16,6 +16,7 @@ import (
 	"novastream/services/badstreams"
 	"novastream/services/debrid"
 	"novastream/services/indexer"
+	"novastream/services/sourcehealth"
 	"novastream/utils/filter"
 )
 
@@ -33,6 +34,7 @@ type IndexerHandler struct {
 	MovieMetadataSvc MovieDetailsProvider
 	DemoMode         bool
 	BadStreams       *badstreams.Service
+	SourceHealthSvc  *sourcehealth.Service
 }
 
 func NewIndexerHandler(s indexerService, demoMode bool) *IndexerHandler {
@@ -51,6 +53,12 @@ func (h *IndexerHandler) SetMovieMetadataService(svc MovieDetailsProvider) {
 
 func (h *IndexerHandler) SetBadStreamsService(svc *badstreams.Service) {
 	h.BadStreams = svc
+}
+
+// SetSourceHealthService enables server-side health/cache annotations for
+// searches requested with includeSourceHealth=true.
+func (h *IndexerHandler) SetSourceHealthService(svc *sourcehealth.Service) {
+	h.SourceHealthSvc = svc
 }
 
 func (h *IndexerHandler) Search(w http.ResponseWriter, r *http.Request) {
@@ -212,12 +220,21 @@ func (h *IndexerHandler) Search(w http.ResponseWriter, r *http.Request) {
 			scored = []models.ScoredNZBResult{}
 		}
 
+		// Opt-in: annotate debrid cache / remembered usenet health. Waits only
+		// a short inline budget; unfinished checks come back "pending" with a
+		// token for GET /indexers/source-health.
+		sourceHealthToken := ""
+		if h.SourceHealthSvc != nil && wantsSourceHealth(r) {
+			sourceHealthToken = h.SourceHealthSvc.Annotate(r.Context(), scored)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if includeSummary {
 			json.NewEncoder(w).Encode(struct {
-				Results  []models.ScoredNZBResult      `json:"results"`
-				Adaptive *models.AdaptiveSearchSummary `json:"adaptive"`
-			}{scored, opts.AdaptiveSummary})
+				Results           []models.ScoredNZBResult      `json:"results"`
+				Adaptive          *models.AdaptiveSearchSummary `json:"adaptive"`
+				SourceHealthToken string                        `json:"sourceHealthToken,omitempty"`
+			}{scored, opts.AdaptiveSummary, sourceHealthToken})
 		} else {
 			json.NewEncoder(w).Encode(scored)
 		}
@@ -252,7 +269,35 @@ func (h *IndexerHandler) Search(w http.ResponseWriter, r *http.Request) {
 	annotateResultsProfile(results, userID)
 
 	w.Header().Set("Content-Type", "application/json")
+	if h.SourceHealthSvc != nil && wantsSourceHealth(r) {
+		json.NewEncoder(w).Encode(h.annotatePlainResults(r.Context(), results))
+		return
+	}
 	json.NewEncoder(w).Encode(results)
+}
+
+func wantsSourceHealth(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("includeSourceHealth")), "true")
+}
+
+// annotatedNZBResult is the unscored search result shape plus the optional
+// source health annotation (keeps the response free of scoring fields).
+type annotatedNZBResult struct {
+	models.NZBResult
+	SourceHealth *models.SourceHealth `json:"sourceHealth,omitempty"`
+}
+
+func (h *IndexerHandler) annotatePlainResults(ctx context.Context, results []models.NZBResult) []annotatedNZBResult {
+	scored := make([]models.ScoredNZBResult, len(results))
+	for i := range results {
+		scored[i].NZBResult = results[i]
+	}
+	h.SourceHealthSvc.Annotate(ctx, scored)
+	out := make([]annotatedNZBResult, len(results))
+	for i := range results {
+		out[i] = annotatedNZBResult{NZBResult: results[i], SourceHealth: scored[i].SourceHealth}
+	}
+	return out
 }
 
 func annotateResultsProfile(results []models.NZBResult, userID string) {
@@ -279,6 +324,40 @@ func annotateScoredResultsProfile(results []models.ScoredNZBResult, userID strin
 		}
 		results[i].Attributes["profileId"] = userID
 	}
+}
+
+// maxSourceHealthWait caps the long-poll wait for GET /indexers/source-health.
+const maxSourceHealthWait = 25 * time.Second
+
+// SourceHealth returns the annotations for a pending search token
+// (GET /indexers/source-health?token=...&waitMs=...). With waitMs the request
+// long-polls until the checks finish or the wait elapses.
+func (h *IndexerHandler) SourceHealth(w http.ResponseWriter, r *http.Request) {
+	if h.SourceHealthSvc == nil {
+		http.Error(w, "source health unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	if token == "" {
+		http.Error(w, "missing token", http.StatusBadRequest)
+		return
+	}
+	var wait time.Duration
+	if raw := strings.TrimSpace(r.URL.Query().Get("waitMs")); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			wait = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if wait > maxSourceHealthWait {
+		wait = maxSourceHealthWait
+	}
+	snapshot, ok := h.SourceHealthSvc.Snapshot(r.Context(), token, wait)
+	if !ok {
+		http.Error(w, "unknown or expired token", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(snapshot)
 }
 
 // SearchTest handles the admin search test endpoint with full scoring breakdown.

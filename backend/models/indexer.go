@@ -57,4 +57,31 @@ type ScoredNZBResult struct {
 	FilterReason   string               `json:"filterReason,omitempty"`   // Reason for exclusion (empty if passed)
 	TotalScore     int                  `json:"totalScore"`               // Sum of all scoring points
 	ScoreBreakdown []ScoreBreakdownItem `json:"scoreBreakdown,omitempty"` // Per-criterion scoring details
+	// SourceHealth is the server-side availability annotation (debrid cache
+	// state / remembered usenet health). Only populated when the search was
+	// requested with includeSourceHealth=true.
+	SourceHealth *SourceHealth `json:"sourceHealth,omitempty"`
+}
+
+// Source health annotation states.
+const (
+	SourceHealthHealthy   = "healthy"    // usenet: last health check passed
+	SourceHealthUnhealthy = "unhealthy"  // usenet: last health check failed
+	SourceHealthCached    = "cached"     // debrid: instantly available
+	SourceHealthNotCached = "not_cached" // debrid: not instantly available
+	SourceHealthPending   = "pending"    // check still running; poll with Token
+	SourceHealthUnknown   = "unknown"    // not checked / no safe quick check
+)
+
+// SourceHealth annotates a search result with health or cache state.
+type SourceHealth struct {
+	State     string     `json:"state"`
+	CheckedAt *time.Time `json:"checkedAt,omitempty"`
+	// Token identifies the background check for pending annotations; poll
+	// GET /api/indexers/source-health?token=... for the final state.
+	Token    string `json:"token,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	// Status is the raw checker status (e.g. debrid "cached"/"not_cached"/"skipped").
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
 }

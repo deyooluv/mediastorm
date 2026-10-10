@@ -65,6 +65,7 @@ import (
 	"novastream/services/scrob"
 	"novastream/services/sessions"
 	"novastream/services/simkl"
+	"novastream/services/sourcehealth"
 	"novastream/services/sports"
 	"novastream/services/streaming"
 	"novastream/services/trakt"
@@ -393,6 +394,9 @@ func main() {
 	// Prequeue handler will be created later after historyService is available
 	var prequeueHandler *handlers.PrequeueHandler
 	usenetHandler := handlers.NewUsenetHandler(usenetService)
+	sourceHealthService := sourcehealth.New(debridPlaybackService, sourcehealth.DefaultConfig())
+	indexerHandler.SetSourceHealthService(sourceHealthService)
+	usenetHandler.SetHealthRecorder(sourceHealthService)
 
 	// Initialize accounts before users — users table has a foreign key on accounts,
 	// so the master account must exist before the default user can be created.
