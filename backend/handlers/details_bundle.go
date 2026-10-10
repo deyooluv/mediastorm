@@ -14,6 +14,7 @@ import (
 
 	"novastream/config"
 	"novastream/models"
+	"novastream/services/history"
 	metadatapkg "novastream/services/metadata"
 
 	"github.com/gorilla/mux"
@@ -100,6 +101,15 @@ type DetailsBundleResponse struct {
 	ContentPreference *models.ContentPreference `json:"contentPreference"`
 	WatchState        *models.SeriesWatchState  `json:"watchState"`
 	PlaybackProgress  []models.PlaybackProgress `json:"playbackProgress"`
+
+	// UpNextEpisode (series only) is the episode the page should offer to play:
+	// watchState.nextEpisode when the user has history, otherwise the first
+	// episode of the first regular season. Carries a canonical itemId.
+	UpNextEpisode *models.EpisodeReference `json:"upNextEpisode,omitempty"`
+	// Resume is the server resume decision for the primary playable item: the
+	// movie, or UpNextEpisode for series. Present (eligible=false) even when
+	// there is no progress, so clients need no thresholds of their own.
+	Resume *models.ResumeState `json:"resume,omitempty"`
 }
 
 // DetailsShellResponse is a lightweight early payload returned by
@@ -454,8 +464,10 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 		}()
 	}
 
-	// 6. Playback progress — filtered to just this title's items to avoid
-	// sending all 293+ items (113 KB) when only 1–20 are needed.
+	// 6. Playback progress — filtered (after details resolve, below) to just
+	// this title's items to avoid sending all 293+ items (113 KB) when only
+	// 1–20 are needed.
+	var allProgress []models.PlaybackProgress
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -466,17 +478,37 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 			log.Printf("[details-bundle] playback progress error: %v", err)
 			return
 		}
-		filtered := filterProgressForTitle(items, titleID, contentType, titleExternalIDs{
-			imdb: strings.ToLower(strings.TrimSpace(imdbID)),
-			tvdb: nonZeroInt64String(tvdbID),
-			tmdb: nonZeroInt64String(tmdbID),
-		})
 		mu.Lock()
-		resp.PlaybackProgress = filtered
+		allProgress = items
 		mu.Unlock()
 	}()
 
+	// 7. Watch history (series only) — used server-side to mark watched
+	// episodes; the history itself is not sent to the client.
+	var watchHistory []models.WatchHistoryItem
+	if contentType == "series" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			items, err := h.history.ListWatchHistory(userID)
+			log.Printf("[details-bundle timing] watch history: %dms (err=%v)", time.Since(start).Milliseconds(), err)
+			if err != nil {
+				log.Printf("[details-bundle] watch history error: %v", err)
+				return
+			}
+			mu.Lock()
+			watchHistory = items
+			mu.Unlock()
+		}()
+	}
+
 	wg.Wait()
+	// detailsDone is always complete here: the similar goroutine waits on it.
+	if allProgress != nil {
+		resp.PlaybackProgress = filterProgressForTitle(allProgress, titleID, contentType, detailsBundleExternalIDs(resp, imdbID, tvdbID, tmdbID))
+	}
+	annotateDetailsBundleProgress(&resp, contentType, titleID, imdbID, tvdbID, tmdbID, watchHistory)
 	log.Printf("[details-bundle timing] TOTAL: %dms (type=%s, titleId=%s)", time.Since(bundleStart).Milliseconds(), contentType, titleID)
 
 	// Ensure nil slices become empty arrays in JSON
@@ -491,6 +523,106 @@ func (h *DetailsBundleHandler) GetDetailsBundle(w http.ResponseWriter, r *http.R
 	}
 
 	writeCompressedJSON(w, r, resp, "details-bundle")
+}
+
+// detailsBundleExternalIDs merges the request's provider IDs with those of the
+// resolved title, so progress recorded under the resolved provider (e.g. a TMDB
+// series ID when the request only carried TVDB) is still matched.
+func detailsBundleExternalIDs(resp DetailsBundleResponse, imdbID string, tvdbID, tmdbID int64) titleExternalIDs {
+	ext := titleExternalIDs{
+		imdb: strings.ToLower(strings.TrimSpace(imdbID)),
+		tvdb: nonZeroInt64String(tvdbID),
+		tmdb: nonZeroInt64String(tmdbID),
+	}
+	var resolved *models.Title
+	if resp.SeriesDetails != nil {
+		resolved = &resp.SeriesDetails.Title
+	} else if resp.MovieDetails != nil {
+		resolved = resp.MovieDetails
+	}
+	if resolved != nil {
+		if v := strings.ToLower(strings.TrimSpace(resolved.IMDBID)); v != "" {
+			ext.imdb = v
+		}
+		if v := nonZeroInt64String(resolved.TVDBID); v != "" {
+			ext.tvdb = v
+		}
+		if v := nonZeroInt64String(resolved.TMDBID); v != "" {
+			ext.tmdb = v
+		}
+	}
+	return ext
+}
+
+// annotateDetailsBundleProgress adds the server-computed progress fields to a
+// details bundle: `resume` on every playbackProgress row, per-episode
+// itemId/watched/resume on series episodes, a merged watchState (resume +
+// nextEpisode.itemId), upNextEpisode, and the top-level resume state.
+func annotateDetailsBundleProgress(resp *DetailsBundleResponse, contentType, titleID, imdbID string, tvdbID, tmdbID int64, watchHistory []models.WatchHistoryItem) {
+	progress := resp.PlaybackProgress
+	resp.PlaybackProgress = history.WithProgressResume(progress)
+
+	if contentType != "series" {
+		var latest *models.PlaybackProgress
+		for i := range progress {
+			if progress[i].MediaType != "movie" {
+				continue
+			}
+			if latest == nil || progress[i].UpdatedAt.After(latest.UpdatedAt) {
+				latest = &progress[i]
+			}
+		}
+		if latest != nil {
+			resp.Resume = history.ProgressResume(*latest)
+		} else if resp.MovieDetails != nil {
+			resp.Resume = &models.ResumeState{}
+		}
+		return
+	}
+
+	seriesID := titleID
+	externalIDs := map[string]string{}
+	if imdbID != "" {
+		externalIDs["imdb"] = imdbID
+	}
+	if tvdbID > 0 {
+		externalIDs["tvdb"] = strconv.FormatInt(tvdbID, 10)
+	}
+	if tmdbID > 0 {
+		externalIDs["tmdb"] = strconv.FormatInt(tmdbID, 10)
+	}
+	if resp.SeriesDetails != nil {
+		t := resp.SeriesDetails.Title
+		if seriesID == "" {
+			seriesID = t.ID
+		}
+		// Resolved metadata IDs beat request params, which may be stale.
+		if t.IMDBID != "" {
+			externalIDs["imdb"] = t.IMDBID
+		}
+		if t.TVDBID > 0 {
+			externalIDs["tvdb"] = strconv.FormatInt(t.TVDBID, 10)
+		}
+		if t.TMDBID > 0 {
+			externalIDs["tmdb"] = strconv.FormatInt(t.TMDBID, 10)
+		}
+	}
+	idx := history.NewSeriesProgressIndex(seriesID, externalIDs, progress, watchHistory)
+	resp.SeriesDetails = idx.AnnotateSeriesDetails(resp.SeriesDetails)
+
+	if resp.WatchState != nil && resp.WatchState.NextEpisode != nil {
+		if merged := history.MergeProgressIntoContinueWatching([]models.SeriesWatchState{*resp.WatchState}, progress); len(merged) == 1 {
+			resp.WatchState = &merged[0]
+		}
+	}
+	resp.UpNextEpisode = idx.UpNextEpisode(resp.WatchState, resp.SeriesDetails)
+	if resp.UpNextEpisode != nil {
+		if resume := idx.Resume(resp.UpNextEpisode.SeasonNumber, resp.UpNextEpisode.EpisodeNumber); resume != nil {
+			resp.Resume = resume
+		} else {
+			resp.Resume = &models.ResumeState{}
+		}
+	}
 }
 
 // InteractiveMetadataPriority marks a request's upstream metadata calls as

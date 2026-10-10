@@ -28,6 +28,9 @@ type fakeHistoryService struct {
 	setOrderType   string
 	setOrderUserID string
 	progressCtx    context.Context
+	progressItems  []models.PlaybackProgress
+	lastProgress   models.PlaybackProgressUpdate
+	lastWatch      models.WatchHistoryUpdate
 }
 
 func (f *fakeHistoryService) RecordEpisode(userID string, payload models.EpisodeWatchPayload) (models.SeriesWatchState, error) {
@@ -81,6 +84,7 @@ func (f *fakeHistoryService) ToggleWatched(userID string, update models.WatchHis
 }
 
 func (f *fakeHistoryService) UpdateWatchHistory(userID string, update models.WatchHistoryUpdate) (models.WatchHistoryItem, error) {
+	f.lastWatch = update
 	return models.WatchHistoryItem{}, f.err
 }
 
@@ -102,7 +106,12 @@ func (f *fakeHistoryService) UpdatePlaybackProgress(userID string, update models
 
 func (f *fakeHistoryService) UpdatePlaybackProgressContext(ctx context.Context, userID string, update models.PlaybackProgressUpdate) (models.PlaybackProgress, error) {
 	f.progressCtx = ctx
-	return models.PlaybackProgress{}, f.err
+	f.lastProgress = update
+	progress := models.PlaybackProgress{MediaType: update.MediaType, ItemID: update.ItemID, Position: update.Position, Duration: update.Duration}
+	if update.Duration > 0 {
+		progress.PercentWatched = update.Position / update.Duration * 100
+	}
+	return progress, f.err
 }
 
 func (f *fakeHistoryService) GetPlaybackProgress(userID, mediaType, itemID string) (*models.PlaybackProgress, error) {
@@ -113,7 +122,7 @@ func (f *fakeHistoryService) GetPlaybackProgress(userID, mediaType, itemID strin
 }
 
 func (f *fakeHistoryService) ListPlaybackProgress(userID string) ([]models.PlaybackProgress, error) {
-	return nil, f.err
+	return f.progressItems, f.err
 }
 
 func (f *fakeHistoryService) DeletePlaybackProgress(userID, mediaType, itemID string) error {

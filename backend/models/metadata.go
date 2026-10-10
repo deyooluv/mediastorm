@@ -136,6 +136,13 @@ type SeriesEpisode struct {
 	AiredDateTimeUTC      string            `json:"airedDateTimeUTC,omitempty"`
 	Runtime               int               `json:"runtimeMinutes,omitempty"`
 	Image                 *Image            `json:"image,omitempty"`
+
+	// Per-user fields populated only on details-bundle responses (never cached
+	// metadata). ItemID is the canonical progress/watch item ID for this episode;
+	// Watched reports watch history; Resume is the server resume decision.
+	ItemID  string       `json:"itemId,omitempty"`
+	Watched bool         `json:"watched,omitempty"`
+	Resume  *ResumeState `json:"resume,omitempty"`
 }
 
 type SeriesSeason struct {

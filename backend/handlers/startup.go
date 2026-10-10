@@ -20,6 +20,7 @@ import (
 	"novastream/internal/mediaidentity"
 	"novastream/models"
 	calendarpkg "novastream/services/calendar"
+	"novastream/services/history"
 	"novastream/services/kids"
 	metadatapkg "novastream/services/metadata"
 	"novastream/services/playback"
@@ -1352,130 +1353,11 @@ func (h *StartupHandler) applyFilters(items []models.TrendingItem, userID string
 	return items
 }
 
-// mergeProgressIntoContinueWatching computes PercentWatched and ResumePercent
-// for each continue-watching item using the playback progress data. This moves
-// the map-building + lookup work from the frontend JS thread to the backend,
-// eliminating ~48 KB of playbackProgress data from the startup payload and
-// ~60 lines of JS processing on low-power devices.
+// mergeProgressIntoContinueWatching computes PercentWatched, ResumePercent and
+// the server resume state for each continue-watching item. The logic lives in
+// the history service so every Continue Watching response shares it.
 func mergeProgressIntoContinueWatching(items []models.SeriesWatchState, progress []models.PlaybackProgress) []models.SeriesWatchState {
-	// Build lookup maps (mirrors the frontend's ContinueWatchingContext logic)
-	byItemID := make(map[string]float64, len(progress)*2)
-	byEpisode := make(map[string]float64)
-	// byExternalEpisode keys episode progress by each series-level external ID
-	// (tvdb/tmdb/imdb) so progress recorded under one provider ID still matches a
-	// continue-watching item that was canonicalised under a different one. This
-	// happens when a series' episodes get recorded under more than one series ID
-	// (e.g. E02 under tmdb:tv:220102 while E01/E03 use tvdb:series:450033).
-	byExternalEpisode := make(map[string]float64)
-	byEpisodeTvdb := make(map[string]float64)
-
-	for _, p := range progress {
-		if p.ItemID != "" {
-			byItemID[p.ItemID] = p.PercentWatched
-		}
-		if p.ID != "" {
-			byItemID[p.ID] = p.PercentWatched
-		}
-		if p.MediaType == "episode" {
-			if p.SeriesID != "" {
-				key := fmt.Sprintf("%s:S%dE%d", p.SeriesID, p.SeasonNumber, p.EpisodeNumber)
-				byEpisode[key] = p.PercentWatched
-			}
-			for _, key := range seriesExternalEpisodeKeys(p.ExternalIDs, p.SeasonNumber, p.EpisodeNumber) {
-				byExternalEpisode[key] = p.PercentWatched
-			}
-			if epTvdb := strings.TrimSpace(p.ExternalIDs["episodeTvdb"]); epTvdb != "" {
-				byEpisodeTvdb[epTvdb] = p.PercentWatched
-			}
-		}
-	}
-
-	episodePercent := func(ep *models.EpisodeReference, item models.SeriesWatchState) float64 {
-		if ep == nil {
-			return 0
-		}
-		if ep.EpisodeID != "" {
-			if pct, ok := byItemID[ep.EpisodeID]; ok {
-				return pct
-			}
-		}
-		key := fmt.Sprintf("%s:S%dE%d", item.SeriesID, ep.SeasonNumber, ep.EpisodeNumber)
-		if pct, ok := byEpisode[key]; ok {
-			return pct
-		}
-		for _, k := range seriesExternalEpisodeKeys(item.ExternalIDs, ep.SeasonNumber, ep.EpisodeNumber) {
-			if pct, ok := byExternalEpisode[k]; ok {
-				return pct
-			}
-		}
-		if ep.TvdbID != "" {
-			if pct, ok := byEpisodeTvdb[strings.TrimSpace(ep.TvdbID)]; ok {
-				return pct
-			}
-		}
-		return 0
-	}
-
-	merged := make([]models.SeriesWatchState, len(items))
-	for i, item := range items {
-		merged[i] = item
-
-		if item.NextEpisode == nil {
-			// Movies may already carry active/enriched progress from the
-			// continue endpoint. Do not let a stale raw zero progress row erase
-			// that value and make the home shelf filter the card out.
-			moviePct := item.ResumePercent
-			if item.PercentWatched > moviePct {
-				moviePct = item.PercentWatched
-			}
-			if rawPct, ok := byItemID[item.SeriesID]; ok && rawPct > moviePct {
-				moviePct = rawPct
-			}
-			merged[i].PercentWatched = moviePct
-			merged[i].ResumePercent = moviePct
-		} else {
-			nextPct := episodePercent(item.NextEpisode, item)
-			lastPct := episodePercent(&item.LastWatched, item)
-			isSame := item.LastWatched.SeasonNumber == item.NextEpisode.SeasonNumber &&
-				item.LastWatched.EpisodeNumber == item.NextEpisode.EpisodeNumber
-
-			resumePct := nextPct
-			if resumePct == 0 && isSame {
-				resumePct = lastPct
-			}
-			pctWatched := resumePct
-			if lastPct > pctWatched {
-				pctWatched = lastPct
-			}
-
-			merged[i].PercentWatched = pctWatched
-			merged[i].ResumePercent = resumePct
-		}
-	}
-
-	return merged
-}
-
-// seriesExternalEpisodeKeys builds provider-agnostic episode lookup keys from a
-// series' external IDs (tvdb/tmdb/imdb). Keying episode progress by every known
-// provider ID lets progress and continue-watching items that reference the same
-// show under different series IDs still resolve to the same key.
-func seriesExternalEpisodeKeys(externalIDs map[string]string, season, episode int) []string {
-	if len(externalIDs) == 0 {
-		return nil
-	}
-	var keys []string
-	for _, idType := range []string{"tvdb", "tmdb", "imdb"} {
-		val := strings.TrimSpace(externalIDs[idType])
-		if val == "" {
-			continue
-		}
-		if idType == "imdb" {
-			val = strings.ToLower(val)
-		}
-		keys = append(keys, fmt.Sprintf("%s:%s:S%dE%d", idType, val, season, episode))
-	}
-	return keys
+	return history.MergeProgressIntoContinueWatching(items, progress)
 }
 
 // slimTrendingItems strips heavy Title fields (releases, trailers, ratings,
