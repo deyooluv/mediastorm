@@ -191,6 +191,9 @@ func (s *Service) FilterShelfVisibility(ctx context.Context, items []models.Tren
 				if id > 0 && s.tmdb != nil {
 					if full, err := s.cachedTMDBShelfSeries(ctx, id); err == nil {
 						title.Status = full.Status
+						if full.ReleaseDate != "" {
+							title.ReleaseDate = full.ReleaseDate
+						}
 					}
 				}
 				keep[i] = title.Status == models.SeriesReleaseStatusReleased
