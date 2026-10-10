@@ -445,8 +445,20 @@ func nzbFileNameFromResponse(resp *http.Response, downloadURL string) string {
 
 // UsenetHandler exposes endpoints for NNTP-backed NZB health checks.
 type UsenetHandler struct {
-	Service     usenetHealthService
-	trackProber *usenetTrackProber
+	Service      usenetHealthService
+	trackProber  *usenetTrackProber
+	healthMemory usenetHealthRecorder
+}
+
+// usenetHealthRecorder remembers explicit health check outcomes so search
+// results can be annotated server-side (see services/sourcehealth).
+type usenetHealthRecorder interface {
+	RecordUsenetHealth(result models.NZBResult, check *models.NZBHealthCheck)
+}
+
+// SetHealthRecorder enables remembering health check outcomes.
+func (h *UsenetHandler) SetHealthRecorder(recorder usenetHealthRecorder) {
+	h.healthMemory = recorder
 }
 
 var _ usenetHealthService = (*usenetsvc.Service)(nil)
@@ -512,6 +524,9 @@ func (h *UsenetHandler) CheckHealth(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
+	}
+	if h.healthMemory != nil && res != nil {
+		h.healthMemory.RecordUsenetHealth(request.Result, res)
 	}
 
 	// Probe for tracks when requested and the file is healthy.

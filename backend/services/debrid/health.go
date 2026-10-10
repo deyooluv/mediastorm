@@ -908,6 +908,12 @@ func shouldUseQuickTorboxCacheCheck(providers []config.DebridProviderSettings, s
 	return selected.Enabled && strings.TrimSpace(selected.APIKey) != ""
 }
 
+// QuickCacheKey returns the provider+info-hash key used to dedupe quick cache
+// checks, or "" when the result has no info hash (no safe quick check).
+func QuickCacheKey(result models.NZBResult) string {
+	return quickCacheDedupKey(result)
+}
+
 func quickCacheDedupKey(result models.NZBResult) string {
 	provider := strings.ToLower(strings.TrimSpace(result.Attributes["provider"]))
 	infoHash := quickCacheInfoHash(result)
