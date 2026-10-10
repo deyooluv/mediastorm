@@ -154,18 +154,18 @@ func detectClosedCaptionsInSegments(ctx context.Context, outputDir, ffmpegPath s
 // ccExtractor feeds local live TS segments into a long-lived ccextractor process
 // (preferred) or a bounded ffmpeg sliding window (fallback).
 type ccExtractor struct {
-	mu         sync.Mutex
-	cancel     context.CancelFunc
-	outputPath string
-	outputDir  string
-	ffmpegPath string
-	ccPath     string // empty => ffmpeg fallback
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	running    bool
-	seenSegs   map[int]bool
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	outputPath  string
+	outputDir   string
+	ffmpegPath  string
+	ccPath      string // empty => ffmpeg fallback
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	running     bool
+	seenSegs    map[int]bool
 	lastMaxSeen int
-	mode       string // "ccextractor" or "ffmpeg"
+	mode        string // "ccextractor" or "ffmpeg"
 }
 
 // startCCExtraction starts background CC extraction for a live session directory.

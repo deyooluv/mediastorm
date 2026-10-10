@@ -13,8 +13,8 @@ func TestConvertSRTToWebVTT(t *testing.T) {
 		expected string
 	}{
 		{
-			name: "basic SRT single lines",
-			input: "1\n00:00:05,000 --> 00:00:07,500\nHello, world!\n\n2\n00:00:08,000 --> 00:00:10,500\nHow are you?",
+			name:     "basic SRT single lines",
+			input:    "1\n00:00:05,000 --> 00:00:07,500\nHello, world!\n\n2\n00:00:08,000 --> 00:00:10,500\nHow are you?",
 			expected: "1\n00:00:05,000 --> 00:00:07,500\nHello, world!\n\n2\n00:00:08,000 --> 00:00:10,500\nHow are you?\n\n",
 		},
 		{
@@ -23,28 +23,28 @@ func TestConvertSRTToWebVTT(t *testing.T) {
 			expected: "",
 		},
 		{
-			name: "roll-up CC deduplication",
-			input: "1\n00:00:05,000 --> 00:00:07,000\nOLD LINE\nNEW LINE ONE\n\n2\n00:00:07,000 --> 00:00:09,000\nNEW LINE ONE\nNEW LINE TWO\n\n3\n00:00:09,000 --> 00:00:11,000\nNEW LINE TWO\nNEW LINE THREE",
+			name:     "roll-up CC deduplication",
+			input:    "1\n00:00:05,000 --> 00:00:07,000\nOLD LINE\nNEW LINE ONE\n\n2\n00:00:07,000 --> 00:00:09,000\nNEW LINE ONE\nNEW LINE TWO\n\n3\n00:00:09,000 --> 00:00:11,000\nNEW LINE TWO\nNEW LINE THREE",
 			expected: "1\n00:00:05,000 --> 00:00:07,000\nOLD LINE\nNEW LINE ONE\n\n2\n00:00:07,000 --> 00:00:09,000\nNEW LINE TWO\n\n3\n00:00:09,000 --> 00:00:11,000\nNEW LINE THREE\n\n",
 		},
 		{
-			name: "trims whitespace",
-			input: "1\n00:00:05,000 --> 00:00:07,000\n  HELLO WORLD     ",
+			name:     "trims whitespace",
+			input:    "1\n00:00:05,000 --> 00:00:07,000\n  HELLO WORLD     ",
 			expected: "1\n00:00:05,000 --> 00:00:07,000\nHELLO WORLD\n\n",
 		},
 		{
-			name: "preserves italic tags",
-			input: "1\n00:00:05,000 --> 00:00:07,000\n<i>Whispered text</i>",
+			name:     "preserves italic tags",
+			input:    "1\n00:00:05,000 --> 00:00:07,000\n<i>Whispered text</i>",
 			expected: "1\n00:00:05,000 --> 00:00:07,000\n<i>Whispered text</i>\n\n",
 		},
 		{
-			name: "handles CRLF line endings",
-			input: "1\r\n00:00:06,000 --> 00:00:08,000\r\nHello!\r\n\r\n2\r\n00:00:09,000 --> 00:00:11,000\r\nWorld!",
+			name:     "handles CRLF line endings",
+			input:    "1\r\n00:00:06,000 --> 00:00:08,000\r\nHello!\r\n\r\n2\r\n00:00:09,000 --> 00:00:11,000\r\nWorld!",
 			expected: "1\n00:00:06,000 --> 00:00:08,000\nHello!\n\n2\n00:00:09,000 --> 00:00:11,000\nWorld!\n\n",
 		},
 		{
-			name: "strips lingering h escape markers",
-			input: "1\n00:00:05,000 --> 00:00:07,000\nHELLO\\hWORLD",
+			name:     "strips lingering h escape markers",
+			input:    "1\n00:00:05,000 --> 00:00:07,000\nHELLO\\hWORLD",
 			expected: "1\n00:00:05,000 --> 00:00:07,000\nHELLO WORLD\n\n",
 		},
 	}

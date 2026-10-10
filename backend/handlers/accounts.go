@@ -117,7 +117,6 @@ func (h *AccountsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-
 // Rename changes an account's username (master only).
 func (h *AccountsHandler) Rename(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)

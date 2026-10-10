@@ -41,7 +41,7 @@ func (recordingClientSettings) Update(clientID, userID string, settings models.C
 	return nil
 }
 func (recordingClientSettings) Delete(clientID, userID string) error { return nil }
-func (recordingClientSettings) DeleteByClient(clientID string) error  { return nil }
+func (recordingClientSettings) DeleteByClient(clientID string) error { return nil }
 func (recordingClientSettings) Move(clientID, fromUserID, toUserID string) error {
 	return nil
 }

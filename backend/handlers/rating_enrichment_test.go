@@ -11,9 +11,9 @@ import (
 // mockMetadataForRatings implements the metadataService methods needed by enrichWatchlistRatings.
 type mockMetadataForRatings struct {
 	metadataService
-	enabled      bool
+	enabled       bool
 	cachedRatings map[string][]models.Rating // keyed by imdbID — returned by cached lookup
-	ratings      map[string][]models.Rating // keyed by imdbID — returned by full fetch (background warm)
+	ratings       map[string][]models.Rating // keyed by imdbID — returned by full fetch (background warm)
 }
 
 func (m *mockMetadataForRatings) MDBListIsEnabled() bool {
@@ -62,7 +62,7 @@ func TestEnrichWatchlistRatings_SkipsNoIMDB(t *testing.T) {
 		{ID: "1", ExternalIDs: map[string]string{"tmdb": "999"}},
 	}
 	meta := &mockMetadataForRatings{
-		enabled:      true,
+		enabled:       true,
 		cachedRatings: map[string][]models.Rating{},
 	}
 	enrichWatchlistRatings(context.Background(), items, meta)
@@ -103,7 +103,7 @@ func TestEnrichWatchlistRatings_CacheMissTriggersBackgroundWarm(t *testing.T) {
 		{ID: "1", MediaType: "movie", ExternalIDs: map[string]string{"imdb": "tt1234567"}},
 	}
 	meta := &mockMetadataForRatings{
-		enabled:      true,
+		enabled:       true,
 		cachedRatings: map[string][]models.Rating{}, // empty cache = miss
 		ratings: map[string][]models.Rating{
 			"tt1234567": {{Source: "imdb", Value: 7.5, Max: 10}},
