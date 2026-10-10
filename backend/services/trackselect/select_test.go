@@ -106,7 +106,9 @@ type fakeConfig struct {
 
 func (f fakeConfig) Load() (config.Settings, error) { return f.settings, f.err }
 
-type fakeUserSettings struct{ playback map[string]models.PlaybackSettings }
+type fakeUserSettings struct {
+	playback map[string]models.PlaybackSettings
+}
 
 func (f fakeUserSettings) GetWithDefaults(userID string, defaults models.UserSettings) (models.UserSettings, error) {
 	if p, ok := f.playback[userID]; ok {
