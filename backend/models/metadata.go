@@ -83,6 +83,8 @@ type Title struct {
 	Releases          []Release   `json:"releases,omitempty"`
 	Theatrical        *Release    `json:"theatricalRelease,omitempty"`
 	HomeRelease       *Release    `json:"homeRelease,omitempty"`
+	ReleaseDate       string      `json:"releaseDate,omitempty"`       // YYYY-MM-DD the title first became/becomes watchable (movie: earliest theatrical/home window, else primary release date; series: premiere/first air date)
+	Availability      string      `json:"availability,omitempty"`      // Derived at encode time: released | theatrical | coming_soon | unreleased (see ReleaseAvailability)
 	Ratings           []Rating    `json:"ratings,omitempty"`           // Aggregated ratings from MDBList
 	Credits           *Credits    `json:"credits,omitempty"`           // Top billed cast
 	RuntimeMinutes    int         `json:"runtimeMinutes,omitempty"`    // Runtime in minutes (movies only)
@@ -250,6 +252,9 @@ func MovieReleaseStatus(title Title) string {
 	status := MovieReleaseStatusFromWindows(title.Theatrical, title.HomeRelease)
 	if status != MovieReleaseStatusUnknown {
 		return status
+	}
+	if dated := MovieReleaseStatusFromReleaseDate(title.ReleaseDate); dated != MovieReleaseStatusUnknown {
+		return dated
 	}
 	if title.Year > 0 && title.Year < time.Now().Year() {
 		return MovieReleaseStatusReleased

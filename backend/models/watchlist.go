@@ -27,6 +27,8 @@ type WatchlistItem struct {
 	LifecycleStatus string            `json:"lifecycleStatus,omitempty"` // series lifecycle
 	Theatrical      *Release          `json:"theatricalRelease,omitempty"`
 	HomeRelease     *Release          `json:"homeRelease,omitempty"`
+	ReleaseDate     string            `json:"releaseDate,omitempty"`  // YYYY-MM-DD first watchable date (see Title.ReleaseDate)
+	Availability    string            `json:"availability,omitempty"` // derived at encode time (see Title.Availability)
 }
 
 // WatchlistTombstone records an explicit user removal so source syncs do not
