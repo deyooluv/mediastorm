@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"novastream/internal/auth"
 	"novastream/models"
 	"novastream/services/badstreams"
 	playbacksvc "novastream/services/playback"
+	"novastream/services/trackselect"
 )
 
 type playbackService interface {
@@ -33,7 +35,15 @@ type PlaybackHandler struct {
 	VideoProber        VideoFullProber      // For probing subtitle streams
 	BadStreams         *badstreams.Service
 	ThumbnailPrewarmer thumbnailPrewarmer
+	// TrackPreferences resolves profile/client/title language preferences for
+	// the optional track selection returned by Resolve.
+	TrackPreferences *trackselect.Resolver
+	Users            prequeueOwnershipService
 }
+
+// trackSelectionProbeTimeout bounds the probe Resolve runs for track selection.
+// The probe result is cached and reused by the follow-up metadata request.
+const trackSelectionProbeTimeout = 20 * time.Second
 
 var _ playbackService = (*playbacksvc.Service)(nil)
 
@@ -68,6 +78,79 @@ func (h *PlaybackHandler) SetThumbnailPrewarmer(prewarmer thumbnailPrewarmer) {
 	h.ThumbnailPrewarmer = prewarmer
 }
 
+// SetTrackPreferenceResolver configures the shared track preference resolver.
+func (h *PlaybackHandler) SetTrackPreferenceResolver(resolver *trackselect.Resolver) {
+	h.TrackPreferences = resolver
+}
+
+// SetUsersService enables profile ownership checks for profileId.
+func (h *PlaybackHandler) SetUsersService(svc prequeueOwnershipService) {
+	h.Users = svc
+}
+
+func (h *PlaybackHandler) canUseProfile(r *http.Request, profileID string) bool {
+	if profileID == "" || h.Users == nil || auth.IsMaster(r) {
+		return true
+	}
+	accountID := auth.GetAccountID(r)
+	return accountID != "" && h.Users.BelongsToAccount(profileID, accountID)
+}
+
+// withTrackSelection returns a copy of resolution carrying the shared track
+// selection for the given profile/client/title. The profile is ignored unless
+// the caller's account owns it; the client falls back to X-Client-ID.
+func (h *PlaybackHandler) withTrackSelection(r *http.Request, resolution *models.PlaybackResolution, profileID, clientID, titleID string) *models.PlaybackResolution {
+	if resolution == nil || strings.TrimSpace(resolution.WebDAVPath) == "" {
+		return resolution
+	}
+	profileID = strings.TrimSpace(profileID)
+	if !h.canUseProfile(r, profileID) {
+		profileID = ""
+	}
+	clientID = normalizeClientID(clientID)
+	if clientID == "" {
+		clientID = normalizeClientID(r.Header.Get("X-Client-ID"))
+	}
+	selection := h.selectTracks(r.Context(), resolution, profileID, clientID, strings.TrimSpace(titleID))
+	if selection == nil {
+		return resolution
+	}
+	withTracks := *resolution
+	withTracks.TrackSelection = selection
+	return &withTracks
+}
+
+// selectTracks probes the resolved source (reusing any probe the resolver
+// already ran) and applies the shared track selection. It returns nil when the
+// source cannot be probed; track selection never fails a resolve.
+func (h *PlaybackHandler) selectTracks(ctx context.Context, resolution *models.PlaybackResolution, profileID, clientID, titleID string) *models.TrackSelection {
+	if resolution == nil || strings.TrimSpace(resolution.WebDAVPath) == "" {
+		return nil
+	}
+	probe := resolution.Probe
+	if probe == nil {
+		if h.VideoProber == nil {
+			return nil
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, trackSelectionProbeTimeout)
+		defer cancel()
+		result, err := h.VideoProber.ProbeVideoFull(probeCtx, resolution.WebDAVPath)
+		if err != nil {
+			log.Printf("[playback-handler] track selection probe failed (non-fatal): %v", err)
+			return nil
+		}
+		probe = result
+	}
+	if probe == nil || (len(probe.AudioStreams) == 0 && len(probe.SubtitleStreams) == 0) {
+		return nil
+	}
+	prefs := h.TrackPreferences.Resolve(profileID, clientID, titleID)
+	selection := trackselect.Select(probe.AudioStreams, probe.SubtitleStreams, prefs)
+	log.Printf("[playback-handler] track selection: audio=%d subtitle=%d (audioLang=%q subLang=%q subMode=%s)",
+		selection.AudioStreamIndex(), selection.SubtitleStreamIndex(), prefs.AudioLanguage, prefs.SubtitleLanguage, prefs.SubtitleMode)
+	return selection
+}
+
 func (h *PlaybackHandler) prewarmThumbnails(resolution *models.PlaybackResolution) {
 	if h == nil || h.ThumbnailPrewarmer == nil || resolution == nil || strings.TrimSpace(resolution.WebDAVPath) == "" {
 		return
@@ -82,6 +165,11 @@ func (h *PlaybackHandler) Resolve(w http.ResponseWriter, r *http.Request) {
 		StartOffset    float64          `json:"startOffset,omitempty"` // Seek position in seconds for subtitle extraction
 		ProfileID      string           `json:"profileId,omitempty"`
 		AllowMarkedBad bool             `json:"allowMarkedBad,omitempty"`
+		// IncludeTrackSelection asks the server to probe the resolved source and
+		// return its audio/subtitle choice (trackSelection) for this profile.
+		IncludeTrackSelection bool   `json:"includeTrackSelection,omitempty"`
+		TitleID               string `json:"titleId,omitempty"`  // per-title language preference key
+		ClientID              string `json:"clientId,omitempty"` // per-device overrides; falls back to X-Client-ID
 	}
 
 	dec := json.NewDecoder(r.Body)
@@ -124,6 +212,10 @@ func (h *PlaybackHandler) Resolve(w http.ResponseWriter, r *http.Request) {
 	}
 	h.prewarmThumbnails(resolution)
 	log.Printf("[playback-handler] TIMING: resolve complete (took: %v)", time.Since(handlerStart))
+
+	if request.IncludeTrackSelection {
+		resolution = h.withTrackSelection(r, resolution, request.ProfileID, request.ClientID, firstNonEmpty(request.TitleID, request.Result.Attributes["titleId"]))
+	}
 
 	// Subtitle pre-extraction disabled — the player handles subtitles natively.
 	// The old extraction path opened concurrent connections to the streaming provider,
@@ -198,6 +290,12 @@ func (h *PlaybackHandler) QueueStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.prewarmThumbnails(status)
+
+	// Queued resolves report readiness here, so honor the same opt-in.
+	query := r.URL.Query()
+	if include, _ := strconv.ParseBool(query.Get("includeTrackSelection")); include {
+		status = h.withTrackSelection(r, status, query.Get("profileId"), query.Get("clientId"), query.Get("titleId"))
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)

@@ -13,6 +13,7 @@ import (
 
 	"novastream/models"
 	"novastream/services/badstreams"
+	"novastream/services/trackselect"
 )
 
 // mockPlaybackService implements the playbackService interface for testing.
@@ -278,5 +279,147 @@ func TestResolveBatch_Success(t *testing.T) {
 		} else if r.Resolution.WebDAVPath == "" {
 			t.Errorf("result %d: empty webdav path", i)
 		}
+	}
+}
+
+type trackSelectionProber struct {
+	calls int
+}
+
+func (p *trackSelectionProber) ProbeVideoFull(_ context.Context, _ string) (*VideoFullResult, error) {
+	p.calls++
+	return &VideoFullResult{
+		AudioStreams: []AudioStreamInfo{
+			{Index: 1, Codec: "ac3", Language: "eng"},
+			{Index: 2, Codec: "eac3", Language: "jpn"},
+		},
+		SubtitleStreams: []SubtitleStreamInfo{
+			{Index: 3, Codec: "hdmv_pgs_subtitle", Language: "eng"},
+			{Index: 4, Codec: "subrip", Language: "eng"},
+		},
+	}, nil
+}
+
+type trackSelectionUserSettings struct{}
+
+func (trackSelectionUserSettings) GetWithDefaults(userID string, defaults models.UserSettings) (models.UserSettings, error) {
+	if userID == "profile-1" {
+		defaults.Playback.PreferredAudioLanguage = "jpn"
+		defaults.Playback.PreferredSubtitleLanguage = "eng"
+		defaults.Playback.PreferredSubtitleMode = "on"
+	}
+	return defaults, nil
+}
+
+func TestResolve_IncludesTrackSelectionWhenRequested(t *testing.T) {
+	h := NewPlaybackHandler(&mockPlaybackService{
+		resolveFunc: func(ctx context.Context, candidate models.NZBResult) (*models.PlaybackResolution, error) {
+			return &models.PlaybackResolution{WebDAVPath: "/debrid/movie.mkv"}, nil
+		},
+	})
+	prober := &trackSelectionProber{}
+	h.SetVideoProber(prober)
+	h.SetTrackPreferenceResolver(&trackselect.Resolver{UserSettings: trackSelectionUserSettings{}})
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"result":                models.NZBResult{Title: "Movie"},
+		"profileId":             "profile-1",
+		"includeTrackSelection": true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/playback/resolve", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+	h.Resolve(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp models.PlaybackResolution
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	sel := resp.TrackSelection
+	if sel == nil || sel.Audio == nil || sel.Audio.StreamIndex != 2 || sel.Audio.TypeIndex != 1 {
+		t.Fatalf("audio selection = %#v", sel)
+	}
+	if sel.Subtitle == nil || sel.Subtitle.StreamIndex != 3 || !sel.Subtitle.Bitmap {
+		t.Fatalf("subtitle selection = %#v", sel.Subtitle)
+	}
+	if sel.TextSubtitle == nil || sel.TextSubtitle.StreamIndex != 4 || sel.TextSubtitle.LanguageIndex != 1 {
+		t.Fatalf("text subtitle selection = %#v", sel.TextSubtitle)
+	}
+	if prober.calls != 1 {
+		t.Fatalf("probe calls = %d, want 1", prober.calls)
+	}
+}
+
+func TestResolve_OmitsTrackSelectionByDefault(t *testing.T) {
+	h := NewPlaybackHandler(&mockPlaybackService{})
+	prober := &trackSelectionProber{}
+	h.SetVideoProber(prober)
+
+	body, _ := json.Marshal(map[string]interface{}{"result": models.NZBResult{Title: "Movie"}})
+	req := httptest.NewRequest(http.MethodPost, "/api/playback/resolve", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+	h.Resolve(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("trackSelection")) || prober.calls != 0 {
+		t.Fatalf("unexpected track selection/probe: body=%s calls=%d", rec.Body.String(), prober.calls)
+	}
+}
+
+func TestResolve_ReusesResolverProbeForTrackSelection(t *testing.T) {
+	h := NewPlaybackHandler(&mockPlaybackService{
+		resolveFunc: func(ctx context.Context, candidate models.NZBResult) (*models.PlaybackResolution, error) {
+			return &models.PlaybackResolution{
+				WebDAVPath: "https://cdn.example/movie.mkv",
+				Probe: &models.VideoFullResult{
+					AudioStreams: []models.AudioStreamInfo{{Index: 1, Codec: "aac", Language: "eng"}},
+				},
+			}, nil
+		},
+	})
+	prober := &trackSelectionProber{}
+	h.SetVideoProber(prober)
+
+	body, _ := json.Marshal(map[string]interface{}{"result": models.NZBResult{Title: "Movie"}, "includeTrackSelection": true})
+	req := httptest.NewRequest(http.MethodPost, "/api/playback/resolve", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+	h.Resolve(rec, req)
+
+	var resp models.PlaybackResolution
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.TrackSelection == nil || resp.TrackSelection.Audio == nil || resp.TrackSelection.Audio.StreamIndex != 1 {
+		t.Fatalf("track selection = %#v", resp.TrackSelection)
+	}
+	if prober.calls != 0 {
+		t.Fatalf("probe calls = %d, want resolver probe reuse", prober.calls)
+	}
+}
+
+func TestQueueStatus_IncludesTrackSelectionWhenRequested(t *testing.T) {
+	h := NewPlaybackHandler(&mockPlaybackService{
+		queueStatusFunc: func(ctx context.Context, queueID int64) (*models.PlaybackResolution, error) {
+			return &models.PlaybackResolution{QueueID: queueID, WebDAVPath: "/usenet/movie.mkv"}, nil
+		},
+	})
+	h.SetVideoProber(&trackSelectionProber{})
+	h.SetTrackPreferenceResolver(&trackselect.Resolver{UserSettings: trackSelectionUserSettings{}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/playback/queue/42?includeTrackSelection=1&profileId=profile-1", nil)
+	req = mux.SetURLVars(req, map[string]string{"queueID": "42"})
+	rec := httptest.NewRecorder()
+	h.QueueStatus(rec, req)
+
+	var resp models.PlaybackResolution
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.TrackSelection == nil || resp.TrackSelection.AudioStreamIndex() != 2 || resp.TrackSelection.SubtitleStreamIndex() != 3 {
+		t.Fatalf("track selection = %#v", resp.TrackSelection)
 	}
 }

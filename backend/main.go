@@ -772,6 +772,7 @@ func main() {
 	prequeueHandler = handlers.NewPrequeueHandler(indexerService, playbackService, historyService, nil, nil, *demoMode)
 	prequeueHandler.SetBadStreamsService(badStreamsService)
 	prequeueHandler.SetUsersService(userService)
+	playbackHandler.SetUsersService(userService)
 	if store != nil {
 		prequeueHandler.GetStore().SetDataStore(store)
 	}
@@ -898,6 +899,9 @@ func main() {
 		prequeueHandler.SetConfigManager(cfgManager)
 		prequeueHandler.SetMetadataService(metadataService)      // For episode counting in pack size filtering
 		prequeueHandler.SetMovieMetadataService(metadataService) // For movie anime detection
+		// Manual source resolve shares prequeue's track selection (includeTrackSelection).
+		playbackHandler.SetVideoProber(videoHandler)
+		playbackHandler.SetTrackPreferenceResolver(prequeueHandler.TrackPreferenceResolver())
 
 		// Wire up subtitle pre-extraction for direct streaming (SDR content)
 		if subtitleMgr := videoHandler.GetSubtitleExtractManager(); subtitleMgr != nil {

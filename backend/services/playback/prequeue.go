@@ -136,9 +136,18 @@ type PrequeueStatusResponse struct {
 	Duration       float64 `json:"duration,omitempty"`  // Total duration in seconds (from HLS session probe)
 	FrameRate      string  `json:"frameRate,omitempty"` // Primary video avg_frame_rate from ffprobe
 
-	// Selected tracks (based on user preferences)
-	SelectedAudioTrack    int `json:"selectedAudioTrack"`    // -1 = default/all
-	SelectedSubtitleTrack int `json:"selectedSubtitleTrack"` // -1 = none
+	// Selected tracks (based on user preferences). These are container
+	// (ffprobe) stream numbers, NOT positions in AudioTracks/SubtitleTracks or
+	// in a player's track list; they match AudioTrackInfo.Index /
+	// SubtitleTrackInfo.Index and the HLS audioTrack/subtitleTrack params.
+	// Kept for older clients; prefer TrackSelection.
+	SelectedAudioTrack    int `json:"selectedAudioTrack"`    // container stream index, -1 = player default
+	SelectedSubtitleTrack int `json:"selectedSubtitleTrack"` // container stream index, -1 = none
+
+	// TrackSelection describes the chosen audio/subtitle renditions explicitly
+	// (stream index, type position, language + same-language position, codec,
+	// title, forced) so clients can map them onto their player's track list.
+	TrackSelection *models.TrackSelection `json:"trackSelection,omitempty"`
 
 	// Available tracks (for display in UI)
 	AudioTracks    []AudioTrackInfo    `json:"audioTracks,omitempty"`
@@ -203,9 +212,10 @@ type PrequeueEntry struct {
 	Duration       float64 `json:"duration,omitempty"`
 	FrameRate      string  `json:"frameRate,omitempty"`
 
-	// Selected tracks (based on user preferences)
-	SelectedAudioTrack    int `json:"selectedAudioTrack"`
-	SelectedSubtitleTrack int `json:"selectedSubtitleTrack"`
+	// Selected tracks (based on user preferences); container stream indexes.
+	SelectedAudioTrack    int                    `json:"selectedAudioTrack"`
+	SelectedSubtitleTrack int                    `json:"selectedSubtitleTrack"`
+	TrackSelection        *models.TrackSelection `json:"trackSelection,omitempty"`
 
 	// Pre-extracted subtitle sessions (for direct streaming/VLC path)
 	SubtitleSessions map[int]*models.SubtitleSessionInfo `json:"-"`
@@ -1391,6 +1401,7 @@ func (e *PrequeueEntry) ToResponse() *PrequeueStatusResponse {
 		FrameRate:                e.FrameRate,
 		SelectedAudioTrack:       e.SelectedAudioTrack,
 		SelectedSubtitleTrack:    e.SelectedSubtitleTrack,
+		TrackSelection:           e.TrackSelection,
 		AudioTracks:              e.AudioTracks,
 		SubtitleTracks:           e.SubtitleTracks,
 		SubtitleSessions:         e.SubtitleSessions,
