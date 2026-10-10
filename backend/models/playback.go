@@ -69,4 +69,7 @@ type PlaybackResolution struct {
 	Probe *VideoFullResult `json:"-"`
 	// Pre-extracted subtitles (for manual selection path)
 	SubtitleSessions map[int]*SubtitleSessionInfo `json:"subtitleSessions,omitempty"`
+	// TrackSelection is the server's audio/subtitle choice for this source.
+	// Only populated when the resolve request sets includeTrackSelection.
+	TrackSelection *TrackSelection `json:"trackSelection,omitempty"`
 }

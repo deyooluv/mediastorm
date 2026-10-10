@@ -2522,6 +2522,10 @@ func TestAdoptMigrationReplacesPrequeueStream(t *testing.T) {
 	if resp.SelectedAudioTrack != 1 || resp.SelectedSubtitleTrack != -1 {
 		t.Fatalf("selected tracks = audio %d subtitle %d, want 1/-1", resp.SelectedAudioTrack, resp.SelectedSubtitleTrack)
 	}
+	if resp.TrackSelection == nil || resp.TrackSelection.Audio == nil || resp.TrackSelection.Audio.StreamIndex != 1 ||
+		resp.TrackSelection.Audio.TypeIndex != 0 || resp.TrackSelection.Subtitle != nil || resp.TrackSelection.SubtitleMode != "off" {
+		t.Fatalf("trackSelection = %#v, want audio stream 1 and subtitles off", resp.TrackSelection)
+	}
 	if len(resp.AudioTracks) != 2 || len(resp.SubtitleTracks) != 1 || len(resp.SubtitleSessions) != 0 {
 		t.Fatalf("track/subtitle state = audio=%d subtitle=%d sessions=%d, want 2/1/0", len(resp.AudioTracks), len(resp.SubtitleTracks), len(resp.SubtitleSessions))
 	}
