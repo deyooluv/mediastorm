@@ -2160,8 +2160,24 @@ func (h *LiveHandler) resolveProfileLiveSource(r *http.Request, globalSettings c
 }
 
 func (h *LiveHandler) resolveProfileLiveSourceForID(profileID string, globalSettings config.Settings) models.ResolvedLiveSource {
-	globalSettings = config.FilterSettingsForProfile(globalSettings, profileID)
-	global := models.ResolvedLiveSource{
+	global := globalResolvedLiveSource(config.FilterSettingsForProfile(globalSettings, profileID))
+
+	if profileID == "" || h.userSettingsSvc == nil {
+		return global
+	}
+
+	userSettings, err := h.userSettingsSvc.Get(profileID)
+	if err != nil || userSettings == nil {
+		return global
+	}
+
+	return models.ResolveLiveSource(&userSettings.LiveTV, &global)
+}
+
+// globalResolvedLiveSource converts global Live settings without applying any
+// per-profile source restrictions.
+func globalResolvedLiveSource(globalSettings config.Settings) models.ResolvedLiveSource {
+	return models.ResolvedLiveSource{
 		Mode:                    globalSettings.Live.Mode,
 		PlaylistURL:             globalSettings.Live.PlaylistURL,
 		HDHomeRunHost:           globalSettings.Live.HDHomeRunHost,
@@ -2193,17 +2209,6 @@ func (h *LiveHandler) resolveProfileLiveSourceForID(profileID string, globalSett
 		EPGRetentionDays:        globalSettings.Live.EPG.RetentionDays,
 		EPGTimeOffsetMinutes:    globalSettings.Live.EPG.TimeOffsetMinutes,
 	}
-
-	if profileID == "" || h.userSettingsSvc == nil {
-		return global
-	}
-
-	userSettings, err := h.userSettingsSvc.Get(profileID)
-	if err != nil || userSettings == nil {
-		return global
-	}
-
-	return models.ResolveLiveSource(&userSettings.LiveTV, &global)
 }
 
 // FetchFilteredChannelsForRequest resolves the caller's configured Live TV sources
@@ -2576,6 +2581,17 @@ func (h *LiveHandler) GetChannels(w http.ResponseWriter, r *http.Request) {
 
 // GetCategories returns all available categories from the configured playlist.
 func (h *LiveHandler) GetCategories(w http.ResponseWriter, r *http.Request) {
+	h.getCategories(w, r, false)
+}
+
+// AdminGetCategories serves the admin settings category picker. Without a
+// profileId it edits the global source list, so profile-restricted sources
+// must stay visible and keep their settings-list indexes.
+func (h *LiveHandler) AdminGetCategories(w http.ResponseWriter, r *http.Request) {
+	h.getCategories(w, r, true)
+}
+
+func (h *LiveHandler) getCategories(w http.ResponseWriter, r *http.Request, admin bool) {
 	categoryCounts := make(map[string]int)
 
 	settings, err := h.cfgManager.Load()
@@ -2585,7 +2601,12 @@ func (h *LiveHandler) GetCategories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src := h.resolveProfileLiveSource(r, settings)
+	var src models.ResolvedLiveSource
+	if admin && strings.TrimSpace(r.URL.Query().Get("profileId")) == "" {
+		src = globalResolvedLiveSource(settings)
+	} else {
+		src = h.resolveProfileLiveSource(r, settings)
+	}
 
 	sources := resolvedLiveSources(src)
 	if len(sources) == 0 {

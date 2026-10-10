@@ -1329,3 +1329,46 @@ func TestAddonLookupAllowsSlowerHeadersWithoutChangingPlaybackTimeout(t *testing
 		t.Fatal("lost outbound redirect validation")
 	}
 }
+
+func TestAdminGetCategoriesIncludesProfileRestrictedGlobalSources(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("action") {
+		case "get_live_categories":
+			_, _ = w.Write([]byte(`[{"category_id":"1","category_name":"Restricted News"}]`))
+		case "get_live_streams":
+			_, _ = w.Write([]byte(`[{"stream_id":10,"name":"Channel One","stream_type":"live","category_id":"1"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+
+	mgr := config.NewManager(filepath.Join(t.TempDir(), "settings.json"))
+	if err := mgr.Save(config.Settings{Live: config.LiveSettings{Sources: []config.LivePlaylistSource{
+		{Mode: "stremio", ManifestURL: provider.URL + "/a/manifest.json", AllowedProfiles: []string{"profile-a"}},
+		{Mode: "stremio", ManifestURL: provider.URL + "/b/manifest.json", AllowedProfiles: []string{"profile-a"}},
+		{Mode: "xtream", XtreamHost: provider.URL, XtreamUsername: "user", XtreamPassword: "pass", AllowedProfiles: []string{"profile-b"}},
+	}}}); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	h := NewLiveHandler(provider.Client(), false, "", 24, 0, 0, false, mgr, nil)
+
+	rec := httptest.NewRecorder()
+	h.AdminGetCategories(rec, httptest.NewRequest(http.MethodGet, "/admin/api/live/categories?sourceIndex=2", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var response CategoriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode categories: %v", err)
+	}
+	if len(response.Categories) != 1 || response.Categories[0].Name != "Restricted News" {
+		t.Fatalf("categories = %+v, want Restricted News from config index 2", response.Categories)
+	}
+
+	rec = httptest.NewRecorder()
+	h.GetCategories(rec, httptest.NewRequest(http.MethodGet, "/live/categories?sourceIndex=2", nil))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("non-admin request without profile unexpectedly saw restricted sources")
+	}
+}

@@ -1358,7 +1358,7 @@ func main() {
 	r.HandleFunc("/admin/api/profiles/icon/upload", adminUIHandler.RequireAuth(adminUIHandler.UploadProfileIcon)).Methods(http.MethodPost)
 
 	// Live TV endpoints for admin panel
-	r.HandleFunc("/admin/api/live/categories", adminUIHandler.RequireAuth(liveHandler.GetCategories)).Methods(http.MethodGet)
+	r.HandleFunc("/admin/api/live/categories", adminUIHandler.RequireAuth(liveHandler.AdminGetCategories)).Methods(http.MethodGet)
 	r.HandleFunc("/admin/api/live/channels", adminUIHandler.RequireAuth(liveHandler.GetChannels)).Methods(http.MethodGet)
 	r.HandleFunc("/admin/api/live/stremio/streams", adminUIHandler.RequireAuth(liveHandler.GetStremioStreamOptions)).Methods(http.MethodGet)
 	r.HandleFunc("/admin/api/live/stream", adminUIHandler.RequireAuth(liveHandler.StreamChannel)).Methods(http.MethodGet, http.MethodHead)
